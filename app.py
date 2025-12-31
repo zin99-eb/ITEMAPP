@@ -21,7 +21,7 @@ st.set_page_config(page_title="Items — Doublons & Saisie", page_icon="🧠", l
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-ITEMS_CSV = DATA_DIR / "items.csv"   # utilisé comme base locale si export.csv absent
+ITEMS_CSV = DATA_DIR / "items.csv"   # utilisé si export.csv absent
 EXPORT_CSV = DATA_DIR / "export.csv" # préféré s'il existe
 
 # -------- Utilitaires texte --------
@@ -59,21 +59,18 @@ def auto_detect_sep(sample_path: Path) -> str:
     try:
         with open(sample_path, "r", encoding="utf-8", errors="ignore") as f:
             head = "".join([next(f) for _ in range(5)])
-        if head.count(";") >= head.count(","):
-            return ";"
-        return ","
+        return ";" if head.count(";") >= head.count(",") else ","
     except Exception:
         return ";"  # par défaut
 
 @st.cache_data(ttl=600)
-def load_items() -> pd.DataFrame:
+def load_items() -> tuple[pd.DataFrame, str]:
     """
     Charge d'abord data/export.csv s'il existe, sinon data/items.csv.
-    Gère séparateur et encodage, puis normalise + colonnes auxiliaires.
+    Gère séparateur et encodage, normalise + colonnes auxiliaires.
+    Retourne (df, source_label).
     """
     # 1) Choisir la source
-    source_path = None
-    source_label = ""
     if EXPORT_CSV.exists():
         source_path = EXPORT_CSV
         source_label = "data/export.csv"
@@ -81,7 +78,6 @@ def load_items() -> pd.DataFrame:
         source_path = ITEMS_CSV
         source_label = "data/items.csv"
     else:
-        # Si aucun fichier n'existe, créer items.csv vide
         ensure_items_file()
         source_path = ITEMS_CSV
         source_label = "data/items.csv (créé)"
@@ -94,40 +90,26 @@ def load_items() -> pd.DataFrame:
         df = pd.read_csv(source_path, dtype=str, encoding="latin-1", sep=sep)
 
     if df is None or len(df) == 0:
-        # structure minimaliste pour éviter les erreurs
         df = pd.DataFrame(columns=COLUMNS)
 
     # 3) Renommage de colonnes si l’export n’a pas les mêmes noms
     rename_map = {
-        # francisations courantes / variantes
-        "nom": "item_name",
-        "name": "item_name",
-        "libelle": "french_name",
-        "libellé": "french_name",
-        "unite": "uom_name",
-        "uom": "uom_name",
+        # FR courants
+        "nom": "item_name", "name": "item_name",
+        "libelle": "french_name", "libellé": "french_name",
+        "unite": "uom_name", "uom": "uom_name",
         "type": "type_name",
-        "sous_categorie": "sub_category_name",
-        "sous-categorie": "sub_category_name",
-        "sous catégorie": "sub_category_name",
-        "categorie": "category_name",
-        "catégorie": "category_name",
-        "societe": "company_name",
-        "société": "company_name",
-        "prix": "last_price",
-        "dernier_prix": "last_price",
-        "derniere_utilisation": "last_use",
-        "dernière_utilisation": "last_use",
-        "cree_le": "created_at",
-        "créé_le": "created_at",
-        # variantes anglaises
-        "unit": "uom_name",
-        "company": "company_name",
-        "category": "category_name",
-        "sub_category": "sub_category_name",
+        "sous_categorie": "sub_category_name", "sous-categorie": "sub_category_name", "sous catégorie": "sub_category_name",
+        "categorie": "category_name", "catégorie": "category_name",
+        "societe": "company_name", "société": "company_name",
+        "prix": "last_price", "dernier_prix": "last_price",
+        "derniere_utilisation": "last_use", "dernière_utilisation": "last_use",
+        "cree_le": "created_at", "créé_le": "created_at",
+        # EN courants
+        "unit": "uom_name", "company": "company_name",
+        "category": "category_name", "sub_category": "sub_category_name",
         "created": "created_at",
     }
-    # Appliquer uniquement les clés qui existent
     to_rename = {k: v for k, v in rename_map.items() if k in df.columns and v not in df.columns}
     if to_rename:
         df = df.rename(columns=to_rename)
@@ -158,7 +140,7 @@ def load_items() -> pd.DataFrame:
 def save_items(df: pd.DataFrame):
     """
     Sauvegarde dans items.csv (base locale), sans les colonnes techniques.
-    Remarque: la source de lecture peut être export.csv; la sauvegarde reste dans items.csv.
+    Remarque: on lit prioritairement export.csv; la sauvegarde reste dans items.csv pour ne pas altérer ton export d’origine.
     """
     out = df.copy()
     for col in ["search_text","_item_name_norm","_ref_root"]:
@@ -166,7 +148,7 @@ def save_items(df: pd.DataFrame):
             out.drop(columns=[col], inplace=True)
     out.to_csv(ITEMS_CSV, index=False, encoding="utf-8")
 
-# -------- Filtres (UX comme ton autre app) --------
+# -------- Filtres --------
 def uniq(df, col):
     if col not in df.columns: 
         return [""]
@@ -377,10 +359,10 @@ def detect_duplicate_groups(df: pd.DataFrame, block_cols: list, threshold=0.82, 
 st.title("🧠 Items — Saisie & Détection de doublons (LOCAL)")
 
 # Charger les données et afficher la source
-(df_all, source_label) = load_items()
-st.caption(f"📂 Source chargée : **{source_label}**")
+df_all, source_label = load_items()
+st.caption(f"📂 Source chargée : **{source_label}** • lignes: {len(df_all)}")
 
-# -------- Filtres (comme ta capture) --------
+# -------- Filtres --------
 with st.expander("🎚️ Filtres (optionnels)"):
     c1, c2, c3 = st.columns(3)
     f_company = c1.selectbox("Société", uniq(df_all, "company_name"))
@@ -425,7 +407,6 @@ with tab1:
         }
         candidates = find_duplicates_for_entry(df, new_row, topn=topn, threshold=threshold)
 
-        # On montre d'abord les matches exacts item_name, puis le fuzzy
         if len(candidates) == 0:
             st.success("✅ Aucun doublon évident trouvé.")
         else:
@@ -480,7 +461,6 @@ with tab1:
 with tab2:
     st.subheader("🧹 Scanner les doublons sur toute la base")
     st.caption("Astuce : utilisez des colonnes de blocage pour éviter les comparaisons inutiles.")
-    # Ajout d'item_name comme colonne de blocage (comme demandé)
     options_blocks = [c for c in ["item_name","company_name","type_name","sub_category_name","category_name","uom_name"] if c in df.columns]
     default_blocks = [c for c in ["item_name","type_name","category_name","uom_name"] if c in options_blocks]
     block_cols = st.multiselect("Colonnes de blocage", options_blocks, default=default_blocks)
