@@ -1,0 +1,20 @@
+
+services:
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: iaapp:latest          # image locale construite depuis le Dockerfile
+    container_name: iaapp
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: >
+      streamlit run App.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+    restart: unless-stopped
