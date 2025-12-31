@@ -1,3 +1,4 @@
+
 # ================================================================
 # Assistant IA Items – Version Optimisée pour Streamlit Cloud
 # Auteur : Zineb FAKKAR – Janv 2026
@@ -14,6 +15,7 @@ import logging
 import traceback
 from contextlib import contextmanager
 from datetime import datetime
+import os
 
 # ============= Configuration early ==================================
 st.set_page_config(
@@ -22,6 +24,19 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ============= Paths (relatifs au fichier courant) ==================
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+LOGS_DIR = BASE_DIR / "logs"
+
+# Diagnostic rapide
+st.write("📁 BASE_DIR:", str(BASE_DIR))
+try:
+    st.write("📁 Contenu racine:", os.listdir(BASE_DIR))
+except Exception:
+    st.write("Contenu racine: impossible à lister")
+st.write("📁 Contenu /data:", os.listdir(DATA_DIR) if DATA_DIR.exists() else "data/ introuvable")
 
 # ============= CSS personnalisé =====================================
 st.markdown("""
@@ -63,6 +78,7 @@ def show_errors(section):
 @st.cache_data(ttl=3600, max_entries=10, show_spinner=False)
 def load_csv_cached(file_or_path):
     """Cache fort pour éviter les rechargements"""
+    # Supporte file_uploader et chemin local
     return pd.read_csv(file_or_path, sep=";", dtype=str, encoding="utf-8")
 
 @st.cache_resource(show_spinner=False)
@@ -169,8 +185,9 @@ class SearchEngine:
         self.df = df
         self._cache = {}
         
+    @staticmethod
     @st.cache_data(ttl=300, show_spinner=False)
-    def preprocess_search_texts(_self, texts):
+    def preprocess_search_texts(texts):
         """Pré-calcul des textes nettoyés"""
         return [clean_text(t) for t in texts]
     
@@ -194,7 +211,7 @@ class SearchEngine:
         
         # Pré-calcul des choix
         choices = self.df["search_text"].tolist()
-        cleaned_choices = self.preprocess_search_texts(choices)
+        cleaned_choices = SearchEngine.preprocess_search_texts(choices)
         
         # Recherche avec limite intelligente
         limit = min(topn * 3, len(choices))  # Recherche large puis filtrage
@@ -260,7 +277,7 @@ def expand_query(q: str) -> str:
 
 # ============= DSU pour détection doublons =========================
 class DSU:
-    def __init__(self, n): 
+    def __init__(self, n):
         self.p = list(range(n))
         self.r = [0]*n
     
@@ -272,13 +289,13 @@ class DSU:
     
     def union(self, a, b):
         ra, rb = self.find(a), self.find(b)
-        if ra == rb: 
+        if ra == rb:
             return
-        if self.r[ra] < self.r[rb]: 
+        if self.r[ra] < self.r[rb]:
             self.p[ra] = rb
-        elif self.r[ra] > self.r[rb]: 
+        elif self.r[ra] > self.r[rb]:
             self.p[rb] = ra
-        else: 
+        else:
             self.p[rb] = ra
             self.r[ra] += 1
 
@@ -356,10 +373,10 @@ with st.spinner("🔍 Préparation de l'application..."):
         else:
             df = st.session_state.df_loaded
     
-    elif Path("data/export.csv").exists():
+    elif (DATA_DIR / "export.csv").exists():
         if st.session_state.df_loaded is None:
             with st.spinner("📊 Chargement depuis data/export.csv..."):
-                df = load_csv("data/export.csv")
+                df = load_csv(str(DATA_DIR / "export.csv"))
                 st.session_state.df_loaded = df
                 st.session_state.search_engine = SearchEngine(df)
                 st.success(f"✅ {len(df)} items chargés")
@@ -387,7 +404,7 @@ f_company = ""
 f_type = ""
 f_cat = ""
 
-if st.session_state.df_loaded is not None:
+if st.session_state.df_loaded is not None and len(st.session_state.df_loaded) > 0:
     with st.expander("🎚️ Filtres (optionnels)"):
         c1, c2, c3 = st.columns(3)
         f_company = c1.selectbox("Société", uniq(st.session_state.df_loaded,"company_name"), help="Filtrer par filiale/société", key="filter_company")
@@ -396,12 +413,12 @@ if st.session_state.df_loaded is not None:
 
     def apply_filters(df):
         m = pd.Series([True]*len(df))
-        if f_company: 
-            m &= (df.get("company_name","") == f_company)
-        if f_type:    
-            m &= (df.get("type_name","") == f_type)
-        if f_cat:     
-            m &= (df.get("category_name","") == f_cat)
+        if f_company and 'company_name' in df.columns:
+            m = m & (df['company_name'] == f_company)
+        if f_type and 'type_name' in df.columns:
+            m = m & (df['type_name'] == f_type)
+        if f_cat and 'category_name' in df.columns:
+            m = m & (df['category_name'] == f_cat)
         return df[m].reset_index(drop=True)
 
     df_current = apply_filters(st.session_state.df_loaded)
@@ -613,7 +630,7 @@ def detect_duplicate_groups_optimized(frame: pd.DataFrame,
             n = len(sub)
             texts = sub['dupe_text'].tolist() 
             
-            # Utiliser DSU optimisé
+            # DSU optimisé
             dsu = DSU(n)
             
             # Comparaisons par paires avec seuil précoce
@@ -632,8 +649,7 @@ def detect_duplicate_groups_optimized(frame: pd.DataFrame,
                     if s >= similarity_threshold:
                         dsu.union(i, j)
             
-            # Compter les composants
-            # Compter les composants
+            # Composants
             comp = {}
             for i in range(n):
                 r = dsu.find(i)
@@ -646,7 +662,7 @@ def detect_duplicate_groups_optimized(frame: pd.DataFrame,
                 
                 group_df = sub.iloc[members].copy()
                 
-                # Trouver le représentant (celui avec la référence la plus complète)
+                # Représentant (référence la plus complète)
                 group_df['ref_len'] = group_df['reference'].fillna('').str.len()
                 rep = group_df.loc[group_df['ref_len'].idxmax()]
                 
@@ -670,7 +686,7 @@ st.markdown("---")
 st.markdown("## 🧹 Détection de doublons (IA légère)")
 st.caption("Regroupe les items très proches. Ajustez le seuil et les colonnes de blocage.")
 
-with st.expander("⚙️ Paramètres doublons"):  # CORRIGÉ : Supprimé key=
+with st.expander("⚙️ Paramètres doublons"):
     options_blocks = [c for c in ['company_name','type_name','sub_category_name','category_name','uom_name','item_name'] if c in df_current.columns]
     default_blocks = [c for c in ['type_name','category_name','uom_name'] if c in options_blocks]
     block_cols = st.multiselect("Colonnes de blocage (pour limiter les comparaisons)", options_blocks, default=default_blocks)
@@ -691,7 +707,7 @@ if st.button("🔎 Détecter les doublons"):
                 b1 = BytesIO()
                 groups_df.to_csv(b1, index=False, encoding="utf-8")
                 b1.seek(0)
-                st.download_button("⬇️ Exporter groupes (CSV)", data=b1.getvalue(), file_name="dupes_groups.csv", mime="text/csv")
+                st.download_button("⬇️ Export groupes (CSV)", data=b1.getvalue(), file_name="dupes_groups.csv", mime="text/csv")
 
                 # Membres
                 st.markdown("### 👥 Membres de tous les groupes")
@@ -706,7 +722,7 @@ if st.button("🔎 Détecter les doublons"):
                 b2 = BytesIO()
                 members_all_df[['group_id']+cols_view].to_csv(b2, index=False, encoding="utf-8")
                 b2.seek(0)
-                st.download_button("⬇️ Exporter membres (CSV)", data=b2.getvalue(), file_name="dupes_members_all.csv", mime="text/csv")
+                st.download_button("⬇️ Export membres (CSV)", data=b2.getvalue(), file_name="dupes_members_all.csv", mime="text/csv")
 
 # ================================================================
 #       Master Data — Clean & Merge Plan (fuzzy composite)
@@ -813,7 +829,7 @@ st.markdown("---")
 st.markdown("## 🗃️ Master Data — Plan de fusion (proposition)")
 st.caption("Score composite : fuzzy + jaccard + phonétique + référence + attributs. Sans ML lourd.")
 
-with st.expander("⚙️ Paramètres Master Data"):  # CORRIGÉ : Supprimé key=
+with st.expander("⚙️ Paramètres Master Data"):
     c1, c2 = st.columns(2)
     with c1:
         threshold_md = st.slider("Seuil de confiance (merge)", 0.60, 0.95, 0.85, 0.01, key="threshold_md")
@@ -969,7 +985,7 @@ st.markdown("---")
 st.markdown("## 🕰️ Obsolescence")
 st.caption("Liste les items jamais utilisés récemment (last_use/created_at).")
 
-with st.expander("⚙️ Paramètres obsolescence"):  # CORRIGÉ : Supprimé key=
+with st.expander("⚙️ Paramètres obsolescence"):
     months = st.slider("Inactivité (mois)", 3, 36, 12, key="months_inactive")
 
 if st.button("🗑️ Lister les obsolètes"):
@@ -1013,7 +1029,7 @@ ORTHO_REPLACE = {
     "mpos": "mpo", "lc/apc": "lc apc", "sc/apc": "sc apc",
 }
 
-syn_path = Path("data/synonyms.csv")
+syn_path = DATA_DIR / "synonyms.csv"
 if syn_path.exists():
     try:
         syn_df = pd.read_csv(syn_path, dtype=str)
@@ -1041,11 +1057,12 @@ if st.button("🧽 Proposer des libellés standardisés"):
         if len(df_current) == 0:
             st.warning("Aucune donnée à traiter")
         else:
-            preview = df_current[['id','item_name','french_name']].copy() if 'id' in df_current.columns else df_current[['item_name','french_name']].copy()
+            preview_cols = [c for c in ['id','item_name','french_name'] if c in df_current.columns]
+            preview = df_current[preview_cols].copy() if preview_cols else df_current[['item_name','french_name']].copy()
             preview['item_name_std'] = preview['item_name'].apply(suggest_standard_name)
             st.dataframe(preview.head(50), use_container_width=True)
             b = BytesIO()
-            preview.to_csv(b, index=False, encoding='utf-8')
+            preview.to_csv(b, index=False, encoding="utf-8")
             b.seek(0)
             st.download_button("⬇️ Export libellés (CSV)", data=b.getvalue(), file_name="item_names_standard.csv", mime="text/csv")
 
@@ -1054,7 +1071,7 @@ if st.button("🧽 Proposer des libellés standardisés"):
 # ================================================================
 def export_advanced_options():
     """Options d'export avancées"""
-    with st.expander("🚀 Export avancé"):  # CORRIGÉ : Supprimé key=
+    with st.expander("🚀 Export avancé"):
         col1, col2 = st.columns(2)
         
         with col1:
@@ -1105,7 +1122,7 @@ export_advanced_options()
 # ================================================================
 def batch_processing():
     """Traitement par lots"""
-    with st.expander("⚙️ Traitement par lots"):  # CORRIGÉ : Supprimé key=
+    with st.expander("⚙️ Traitement par lots"):
         st.markdown("**Correction automatique de formats**")
         
         if st.button("🔄 Standardiser toutes les références"):
