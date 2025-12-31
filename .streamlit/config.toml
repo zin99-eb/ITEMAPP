@@ -1,6 +1,18 @@
+# .streamlit/config.toml
 
 [server]
 headless = true
 enableXsrfProtection = true
+# Taille max d'upload en Mo (optionnel)
 maxUploadSize = 200
-``
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#3E5FFF"
+# Optionnels :
+# backgroundColor = "#FFFFFF"
+# secondaryBackgroundColor = "#F8FAFC"
+# textColor = "#1F2937"
