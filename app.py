@@ -1,6 +1,6 @@
 
 # ================================================================
-# Items — Upload CSV → Détection de doublons → Saisie
+# Items — Upload CSV → Détection de doublons → Saisie + Batch
 # Auteur : Zineb FAKKAR – Janv 2026
 # ================================================================
 
@@ -74,7 +74,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     if to_rename:
         df = df.rename(columns=to_rename)
 
-    # Assurer la présence des colonnes
+    # Assurer la présence des colonnes (schéma base existante)
     for c in EXPECTED_COLS:
         if c not in df.columns:
             df[c] = ""
@@ -83,7 +83,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         df[c] = df[c].astype(str).fillna("").str.strip()
 
-    # search_text robuste
+    # search_text robuste (Series)
     text_cols = ["item_name","french_name","reference","uom_name","type_name","sub_category_name","category_name"]
     if len(df) > 0:
         tmp = df[text_cols].astype(str).agg(" ".join, axis=1)
@@ -120,7 +120,7 @@ def read_local_export_csv() -> pd.DataFrame:
         df = pd.read_csv(EXPORT_CSV_PATH, dtype=str, encoding="latin-1", sep=sep)
     return normalize_df(df)
 
-# -------- Détection doublons (saisie) --------
+# -------- Détection doublons (saisie 1 item) --------
 def find_duplicates_for_entry(df: pd.DataFrame, row: dict, topn=10, threshold=0.82):
     """Retourne candidats doublons triés — 'item_name' identique + fuzzy + boost ref_root."""
     if len(df) == 0:
@@ -173,139 +173,86 @@ def find_duplicates_for_entry(df: pd.DataFrame, row: dict, topn=10, threshold=0.
         out = out.drop_duplicates(subset=["id","reference","item_name"], keep="first")
     return out
 
-# -------- Scan global des doublons --------
-def detect_duplicate_groups(df: pd.DataFrame, block_cols: list, threshold=0.82, max_block_size=2500, same_name_group=True):
-    """
-    Renvoie groups_df, members_df
-    - groupage fuzzy avec blocage
-    - option "same_name_group" : regroupe directement tous les items ayant le même item_name normalisé
-    """
-    if len(df) == 0:
-        return (pd.DataFrame(columns=["group_id","size","representative_reference","representative_name","rule"]),
-                pd.DataFrame())
+# -------- Détection doublons (batch) --------
+def normalize_new_items_df(df_new: pd.DataFrame) -> pd.DataFrame:
+    """Normalise un CSV de nouveaux items à vérifier (colonnes minimales)."""
+    # Renommer colonnes si besoin (mêmes règles)
+    to_rename = {k: v for k, v in RENAME_MAP.items() if k in df_new.columns and v not in df_new.columns}
+    if to_rename:
+        df_new = df_new.rename(columns=to_rename)
 
-    work = df.copy().reset_index(drop=True)
+    # Colonnes minimales pour la vérif (on ne force pas les champs 'id', 'last_use', etc.)
+    required = ["item_name","french_name","reference","uom_name","type_name","sub_category_name","category_name","company_name"]
+    for c in required:
+        if c not in df_new.columns:
+            df_new[c] = ""
 
-    groups = []
-    members = []
-    gid = 1
+    # Normaliser en strings
+    for c in df_new.columns:
+        df_new[c] = df_new[c].astype(str).fillna("").str.strip()
 
-    # A) Groupes "item_name identique"
-    if same_name_group and "_item_name_norm" in work.columns:
-        for name_norm, g in work.groupby("_item_name_norm", dropna=False):
-            if not name_norm or len(g) <= 1:
-                continue
-            g2 = g.copy()
-            g2["ref_len"] = g2["reference"].fillna("").str.len()
-            rep = g2.loc[g2["ref_len"].idxmax()]
-            groups.append({
-                "group_id": gid,
-                "size": len(g2),
-                "representative_reference": rep.get("reference",""),
-                "representative_name": rep.get("item_name",""),
-                "rule": "item_name_identique"
-            })
-            g2.insert(0, "group_id", gid)
-            members.append(g2.drop(columns=["ref_len"]))
-            gid += 1
+    # auxiliaires
+    df_new["_item_name_norm"] = df_new["item_name"].map(lambda x: clean_text(str(x)))
+    df_new["_ref_root"]       = df_new["reference"].map(lambda x: ref_root(str(x)))
+    return df_new
 
-    # B) Fuzzy + blocage
-    work["dupe_text"] = work.apply(lambda r: clean_text(" ".join([
-        r.get('item_name',''), r.get('french_name',''), r.get('reference',''),
-        r.get('uom_name',''), r.get('type_name',''), r.get('sub_category_name',''), r.get('category_name','')
-    ])), axis=1)
+def check_batch_duplicates(df_base: pd.DataFrame, df_new: pd.DataFrame, topn=5, threshold=0.82):
+    """Vérifie une liste d'items vs base. Retourne (summary_df, details_df)."""
+    rows = []
+    det_rows = []
+    for idx, r in df_new.iterrows():
+        row_dict = {
+            "item_name": r.get("item_name",""),
+            "french_name": r.get("french_name",""),
+            "reference": r.get("reference",""),
+            "uom_name": r.get("uom_name",""),
+            "type_name": r.get("type_name",""),
+            "sub_category_name": r.get("sub_category_name",""),
+            "category_name": r.get("category_name",""),
+            "company_name": r.get("company_name",""),
+        }
+        cand = find_duplicates_for_entry(df_base, row_dict, topn=topn, threshold=threshold)
 
-    available = [c for c in block_cols if c in work.columns]
-    if not available:
-        work["_block"] = "ALL"
-        available = ["_block"]
+        exists_exact = False
+        rr_new = ref_root(r.get("reference",""))
+        exists_ref = False
+        best_score = 0.0
+        best_ref = ""
+        best_name = ""
+        best_id = ""
 
-    for _, block in work.groupby(available, dropna=False):
-        block = block.reset_index(drop=True)
-        if len(block) <= 1:
-            continue
+        if len(cand) > 0:
+            exists_exact = any(cand["match_rule"] == "item_name_identique")
+            exists_ref = bool(rr_new) and any(cand["_ref_root"] == rr_new)
+            best_idx = cand["score"].idxmax()
+            best_score = float(cand.loc[best_idx, "score"])
+            best_ref = cand.loc[best_idx, "reference"]
+            best_name = cand.loc[best_idx, "item_name"]
+            best_id   = cand.loc[best_idx, "id"] if "id" in cand.columns else ""
 
-        # Sous-bloc si trop grand
-        if len(block) > max_block_size:
-            block["_hash"] = block["dupe_text"].apply(lambda s: hash(s) % 10)
-            subgroups = [g for _, g in block.groupby("_hash")]
-        else:
-            subgroups = [block]
+            # détail : tag 'batch_row'
+            tmp = cand.copy()
+            tmp.insert(0, "batch_row", idx)
+            det_rows.append(tmp)
 
-        for sub in subgroups:
-            if len(sub) <= 1:
-                continue
-            texts = sub["dupe_text"].tolist()
-            n = len(sub)
-            pair_scores = []
-            for i in range(n):
-                res_i = process.extract(texts[i], texts, scorer=fuzz.token_set_ratio, limit=min(50, n))
-                for candidate in res_i:
-                    j = candidate[2]
-                    if j <= i:
-                        continue
-                    s = candidate[1]/100
-                    # Boost si même ref root
-                    ri = ref_root(sub.iloc[i]["reference"])
-                    rj = ref_root(sub.iloc[j]["reference"])
-                    if ri and rj and ri == rj:
-                        s = max(s, 0.95)
-                    if s >= threshold:
-                        pair_scores.append((i, j, s))
+        rows.append({
+            "batch_row": idx,
+            **row_dict,
+            "exists_exact_name": bool(exists_exact),
+            "exists_same_ref_root": bool(exists_ref),
+            "best_match_score": round(best_score, 4),
+            "best_match_reference": best_ref,
+            "best_match_item_name": best_name,
+            "best_match_id": best_id
+        })
 
-            if not pair_scores:
-                continue
-
-            # DSU simple
-            parent = list(range(n)); rank = [0]*n
-            def find(x):
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-            def union(a, b):
-                ra, rb = find(a), find(b)
-                if ra == rb: return
-                if rank[ra] < rank[rb]:
-                    parent[ra] = rb
-                elif rank[ra] > rank[rb]:
-                    parent[rb] = ra
-                else:
-                    parent[rb] = ra
-                    rank[ra] += 1
-
-            for i, j, s in pair_scores:
-                union(i, j)
-
-            comps = {}
-            for i in range(n):
-                r = find(i)
-                comps.setdefault(r, []).append(i)
-
-            for members_idx in comps.values():
-                if len(members_idx) <= 1:
-                    continue
-                g2 = sub.iloc[members_idx].copy()
-                g2["ref_len"] = g2["reference"].fillna("").str.len()
-                rep = g2.loc[g2["ref_len"].idxmax()]
-                groups.append({
-                    "group_id": gid,
-                    "size": len(g2),
-                    "representative_reference": rep.get("reference",""),
-                    "representative_name": rep.get("item_name",""),
-                    "rule": "fuzzy_blocked"
-                })
-                g2.insert(0, "group_id", gid)
-                members.append(g2.drop(columns=["ref_len"]))
-                gid += 1
-
-    groups_df = pd.DataFrame(groups).sort_values(["rule","size"], ascending=[True, False]) if groups else pd.DataFrame(columns=["group_id","size","representative_reference","representative_name","rule"])
-    members_df = pd.concat(members, ignore_index=True) if members else pd.DataFrame()
-    return groups_df, members_df
+    summary_df = pd.DataFrame(rows)
+    details_df = pd.concat(det_rows, ignore_index=True) if det_rows else pd.DataFrame(columns=["batch_row"])
+    return summary_df, details_df
 
 # ========================= UI =========================
 
-st.sidebar.markdown("### 📥 Étape 1 — Téléverser le CSV")
+st.sidebar.markdown("### 📥 Étape 1 — Téléverser la base existante (CSV)")
 uploaded = st.sidebar.file_uploader("Choisir un fichier (.csv)", type=["csv"], help="UTF‑8 ou Latin‑1 ; séparateur ; ou ,")
 
 col_local = st.sidebar.container()
@@ -334,7 +281,7 @@ if st.sidebar.button("♻️ Vider caches"):
 st.title("🧠 Items — Upload → Doublons → Saisie")
 
 # Si pas de data, on arrête ici
-if "df" not in st.session_state or len(st.session_state["df"]) == 0:
+if "df" not in st.session_state or st.session_state["df"] is None or len(st.session_state["df"]) == 0:
     st.info("➡️ Téléverse un CSV dans la barre latérale pour continuer.")
     st.stop()
 
@@ -360,7 +307,6 @@ tab1, tab2 = st.tabs(["🧹 Détection de doublons (global)", "📝 Saisie & dou
 with tab1:
     st.subheader("🧹 Scanner les doublons sur toute la base (filtrée)")
     st.caption("Astuce : utilisez des colonnes de blocage pour limiter les comparaisons.")
-
     options_blocks = [c for c in ["item_name","company_name","type_name","sub_category_name","category_name","uom_name"] if c in df.columns]
     default_blocks = [c for c in ["item_name","type_name","category_name","uom_name"] if c in options_blocks]
     block_cols = st.multiselect("Colonnes de blocage", options_blocks, default=default_blocks)
@@ -437,37 +383,51 @@ with tab2:
 
         st.session_state["pending_item"] = new_row
 
-    # Enregistre seulement dans la session (et propose un download)
-    if st.session_state.get("pending_item"):
-        st.info("Un item est prêt à être ajouté au CSV (fichier téléchargé).")
-        colY, colZ = st.columns([1, 1])
-        if colY.button("💾 Ajouter l’item au dataset (mémoire)"):
-            row = st.session_state["pending_item"].copy()
-            # Générer un id simple
-            if "id" in df_all.columns and df_all["id"].str.isnumeric().any():
-                try:
-                    next_id = str(int(df_all["id"].dropna().astype(int).max()) + 1)
-                except:
-                    next_id = str(len(df_all) + 1)
-            else:
-                next_id = str(len(df_all) + 1)
-            row["id"] = next_id
-            # Assurer les colonnes
-            for c in EXPECTED_COLS:
-                row.setdefault(c, "")
-            # Append
-            df_updated = pd.concat([df_all[[c for c in df_all.columns if c in EXPECTED_COLS]], pd.DataFrame([row])], ignore_index=True)
-            # Re-normaliser (search_text / auxiliaires)
-            df_updated = normalize_df(df_updated)
-            st.session_state["df"] = df_updated
-            st.success(f"✅ Item ajouté (id={next_id}) au dataset en mémoire.")
-        if colZ.button("🗑️ Annuler"):
-            st.session_state["pending_item"] = None
-            st.info("Saisie annulée.")
+    # ---------- 📦 Vérification en lot (batch) ----------
+    st.subheader("📦 Vérifier une **liste** d'items (batch)")
+    st.caption("Téléverse un CSV avec au minimum : item_name, reference (autres colonnes optionnelles). Les colonnes seront normalisées automatiquement.")
+    uploaded_batch = st.file_uploader("CSV des nouveaux items à vérifier", type=["csv"], key="batch_uploader")
+    use_filtered_base = st.checkbox("Utiliser la **base filtrée** pour la vérification (sinon toute la base chargée)", value=True)
 
-    # Exporter le dataset courant (après ajout éventuel)
-    st.markdown("### ⬇️ Télécharger le CSV mis à jour")
+    if uploaded_batch:
+        # Lire et normaliser la liste
+        raw = uploaded_batch.getvalue()
+        sep_b = auto_detect_sep(raw)
+        try:
+            df_new = pd.read_csv(BytesIO(raw), dtype=str, encoding="utf-8", sep=sep_b)
+        except UnicodeDecodeError:
+            df_new = pd.read_csv(BytesIO(raw), dtype=str, encoding="latin-1", sep=sep_b)
+        df_new = normalize_new_items_df(df_new)
+
+        # Choix de la base
+        base = df if use_filtered_base else df_all
+
+        # Vérifier
+        summary_df, details_df = check_batch_duplicates(base, df_new, topn=topn, threshold=threshold)
+
+        st.markdown("### 📋 Résumé (par item)")
+        st.dataframe(summary_df[
+            ["item_name","reference","company_name","type_name","category_name",
+             "exists_exact_name","exists_same_ref_root","best_match_score",
+             "best_match_reference","best_match_item_name","best_match_id"]
+        ], use_container_width=True)
+
+        # Exports
+        buf_s = BytesIO(); summary_df.to_csv(buf_s, index=False, encoding="utf-8"); buf_s.seek(0)
+        st.download_button("⬇️ Export Résumé (CSV)", data=buf_s.getvalue(), file_name="batch_summary.csv", mime="text/csv", key="dl_summary")
+
+        st.markdown("### 🔎 Détails (tous les candidats par item)")
+        view_cols = [c for c in ["batch_row","id","reference","item_name","french_name","uom_name",
+                                 "type_name","sub_category_name","category_name","company_name","last_price",
+                                 "score","match_rule"] if c in details_df.columns]
+        st.dataframe(details_df[view_cols], use_container_width=True)
+
+        buf_d = BytesIO(); details_df[view_cols].to_csv(buf_d, index=False, encoding="utf-8"); buf_d.seek(0)
+        st.download_button("⬇️ Export Détails (CSV)", data=buf_d.getvalue(), file_name="batch_details.csv", mime="text/csv", key="dl_details")
+
+    # ---------- Export du dataset courant ----------
+    st.markdown("### ⬇️ Télécharger le CSV **base chargée** (après filtres)")
     buf = BytesIO()
-    st.session_state["df"][EXPECTED_COLS].to_csv(buf, index=False, encoding="utf-8")
+    df[EXPECTED_COLS].to_csv(buf, index=False, encoding="utf-8")
     buf.seek(0)
-    st.download_button("Télécharger le CSV", data=buf.getvalue(), file_name="items_updated.csv", mime="text/csv")
+    st.download_button("Télécharger le CSV filtré", data=buf.getvalue(), file_name="items_filtered.csv", mime="text/csv")
