@@ -1,6 +1,7 @@
 
 # ================================================================
-# Items — Saisie & Détection de doublons (LOCAL) + Filtres & Blocage
+# Items — Saisie & Détection de doublons (LOCAL)
+# Charge automatiquement data/export.csv s'il existe
 # Auteur : Zineb FAKKAR – Janv 2026
 # ================================================================
 
@@ -20,7 +21,8 @@ st.set_page_config(page_title="Items — Doublons & Saisie", page_icon="🧠", l
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-ITEMS_CSV = DATA_DIR / "items.csv"
+ITEMS_CSV = DATA_DIR / "items.csv"   # utilisé comme base locale si export.csv absent
+EXPORT_CSV = DATA_DIR / "export.csv" # préféré s'il existe
 
 # -------- Utilitaires texte --------
 def strip_accents(s: str) -> str:
@@ -47,53 +49,117 @@ COLUMNS = [
 ]
 
 def ensure_items_file():
+    """Crée items.csv vide si rien n'existe."""
     if not ITEMS_CSV.exists():
         df = pd.DataFrame(columns=COLUMNS)
         df.to_csv(ITEMS_CSV, index=False, encoding="utf-8")
 
+def auto_detect_sep(sample_path: Path) -> str:
+    """Détecte le séparateur probable (';' ou ',') sur quelques lignes."""
+    try:
+        with open(sample_path, "r", encoding="utf-8", errors="ignore") as f:
+            head = "".join([next(f) for _ in range(5)])
+        if head.count(";") >= head.count(","):
+            return ";"
+        return ","
+    except Exception:
+        return ";"  # par défaut
+
 @st.cache_data(ttl=600)
 def load_items() -> pd.DataFrame:
-    """Lecture robuste + normalisation + clés auxiliaires.
-       Corrige le cas DataFrame vide et force les types 'str' pour éviter l'AttributeError sur .str.lower()."""
-    ensure_items_file()
+    """
+    Charge d'abord data/export.csv s'il existe, sinon data/items.csv.
+    Gère séparateur et encodage, puis normalise + colonnes auxiliaires.
+    """
+    # 1) Choisir la source
+    source_path = None
+    source_label = ""
+    if EXPORT_CSV.exists():
+        source_path = EXPORT_CSV
+        source_label = "data/export.csv"
+    elif ITEMS_CSV.exists():
+        source_path = ITEMS_CSV
+        source_label = "data/items.csv"
+    else:
+        # Si aucun fichier n'existe, créer items.csv vide
+        ensure_items_file()
+        source_path = ITEMS_CSV
+        source_label = "data/items.csv (créé)"
+
+    # 2) Lire avec encodage/sep robustes
+    sep = auto_detect_sep(source_path)
     try:
-        df = pd.read_csv(ITEMS_CSV, dtype=str, encoding="utf-8")
+        df = pd.read_csv(source_path, dtype=str, encoding="utf-8", sep=sep)
     except UnicodeDecodeError:
-        df = pd.read_csv(ITEMS_CSV, dtype=str, encoding="latin-1")
+        df = pd.read_csv(source_path, dtype=str, encoding="latin-1", sep=sep)
 
     if df is None or len(df) == 0:
+        # structure minimaliste pour éviter les erreurs
         df = pd.DataFrame(columns=COLUMNS)
 
-    # Normalisation rapide (tout en texte)
+    # 3) Renommage de colonnes si l’export n’a pas les mêmes noms
+    rename_map = {
+        # francisations courantes / variantes
+        "nom": "item_name",
+        "name": "item_name",
+        "libelle": "french_name",
+        "libellé": "french_name",
+        "unite": "uom_name",
+        "uom": "uom_name",
+        "type": "type_name",
+        "sous_categorie": "sub_category_name",
+        "sous-categorie": "sub_category_name",
+        "sous catégorie": "sub_category_name",
+        "categorie": "category_name",
+        "catégorie": "category_name",
+        "societe": "company_name",
+        "société": "company_name",
+        "prix": "last_price",
+        "dernier_prix": "last_price",
+        "derniere_utilisation": "last_use",
+        "dernière_utilisation": "last_use",
+        "cree_le": "created_at",
+        "créé_le": "created_at",
+        # variantes anglaises
+        "unit": "uom_name",
+        "company": "company_name",
+        "category": "category_name",
+        "sub_category": "sub_category_name",
+        "created": "created_at",
+    }
+    # Appliquer uniquement les clés qui existent
+    to_rename = {k: v for k, v in rename_map.items() if k in df.columns and v not in df.columns}
+    if to_rename:
+        df = df.rename(columns=to_rename)
+
+    # 4) Assurer la présence des colonnes attendues
+    for c in COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+
+    # 5) Normaliser en chaînes
     for c in df.columns:
         df[c] = df[c].astype(str).fillna("").str.strip()
 
-    # Champ de recherche (robuste aux df vides et dtypes)
-    text_cols = [c for c in ["item_name", "french_name", "reference", "uom_name",
-                             "type_name", "sub_category_name", "category_name"]
-                 if c in df.columns]
-
+    # 6) search_text robuste
+    text_cols = ["item_name","french_name","reference","uom_name","type_name","sub_category_name","category_name"]
     if len(text_cols) > 0 and not df.empty:
         tmp = df[text_cols].apply(lambda r: " ".join([str(x) for x in r.values]), axis=1)
         df["search_text"] = tmp.astype(str).str.lower()
     else:
         df["search_text"] = ""
 
-    # Clés auxiliaires pour détection (toujours présentes, même si vide)
-    if "item_name" in df.columns:
-        df["_item_name_norm"] = df["item_name"].map(lambda x: clean_text(str(x)))
-    else:
-        df["_item_name_norm"] = ""
+    # 7) auxiliaires
+    df["_item_name_norm"] = df["item_name"].map(lambda x: clean_text(str(x)))
+    df["_ref_root"] = df["reference"].map(lambda x: ref_root(str(x)))
 
-    if "reference" in df.columns:
-        df["_ref_root"] = df["reference"].map(lambda x: ref_root(str(x)))
-    else:
-        df["_ref_root"] = ""
-
-    return df
+    return df, source_label
 
 def save_items(df: pd.DataFrame):
-    # Nettoyer colonnes techniques avant sauvegarde
+    """
+    Sauvegarde dans items.csv (base locale), sans les colonnes techniques.
+    Remarque: la source de lecture peut être export.csv; la sauvegarde reste dans items.csv.
+    """
     out = df.copy()
     for col in ["search_text","_item_name_norm","_ref_root"]:
         if col in out.columns:
@@ -126,7 +192,7 @@ def find_duplicates_for_entry(df: pd.DataFrame, row: dict, topn=10, threshold=0.
     if len(df) == 0:
         return pd.DataFrame(columns=COLUMNS + ["score","match_rule"])
 
-    # 1) Règle "match exact item_name" (directe — ce que tu as demandé)
+    # 1) Règle "match exact item_name" (directe)
     item_norm = clean_text(row.get("item_name",""))
     exact_name_matches = df[df["_item_name_norm"] == item_norm].copy()
     exact_name_matches["score"] = 1.0
@@ -160,7 +226,6 @@ def find_duplicates_for_entry(df: pd.DataFrame, row: dict, topn=10, threshold=0.
         rr_new = ref_root(row.get("reference",""))
         if rr_new:
             same_ref = df.iloc[idxs]["_ref_root"] == rr_new
-            # mask bool de même longueur que fuzzy_df
             fuzzy_df.loc[same_ref.values, "score"] = fuzzy_df.loc[same_ref.values, "score"].clip(upper=1.0)
 
     # 3) Fusionner exact + fuzzy et re-trier
@@ -311,8 +376,11 @@ def detect_duplicate_groups(df: pd.DataFrame, block_cols: list, threshold=0.82, 
 # ========================= UI =========================
 st.title("🧠 Items — Saisie & Détection de doublons (LOCAL)")
 
+# Charger les données et afficher la source
+(df_all, source_label) = load_items()
+st.caption(f"📂 Source chargée : **{source_label}**")
+
 # -------- Filtres (comme ta capture) --------
-df_all = load_items()
 with st.expander("🎚️ Filtres (optionnels)"):
     c1, c2, c3 = st.columns(3)
     f_company = c1.selectbox("Société", uniq(df_all, "company_name"))
@@ -380,9 +448,9 @@ with tab1:
     if st.session_state.get("pending_item"):
         st.info("Un item est prêt à être enregistré.")
         colY, colZ = st.columns([1, 1])
-        if colY.button("💾 Enregistrer quand même"):
+        if colY.button("💾 Enregistrer dans items.csv"):
             # Recharger toute la base (non filtrée) pour générer un id correct
-            df_all2 = load_items()
+            df_all2, _ = load_items()
             # générer un id simple
             if "id" in df_all2.columns and df_all2["id"].str.isnumeric().any():
                 try:
@@ -399,7 +467,7 @@ with tab1:
 
             df_new = pd.concat([df_all2[[c for c in df_all2.columns if c in COLUMNS]], pd.DataFrame([row])], ignore_index=True)
             save_items(df_new)
-            st.success(f"✅ Item enregistré avec id={next_id}.")
+            st.success(f"✅ Item enregistré avec id={next_id} (dans data/items.csv).")
             st.session_state["pending_item"] = None
             st.cache_data.clear()
             st.experimental_rerun()
@@ -437,4 +505,10 @@ with tab2:
             st.download_button("⬇️ Export Membres (CSV)", data=b2.getvalue(), file_name="dupes_members.csv", mime="text/csv")
 
 st.divider()
-st.success("App locale prête — saisie + doublons (nom identique & fuzzy), filtres et colonnes de blocage.")
+st.success("App locale prête — lecture automatique de export.csv, saisie + doublons (nom identique & fuzzy), filtres et colonnes de blocage.")
+
+# -------- Outils --------
+st.sidebar.markdown("### 🛠️ Outils")
+if st.sidebar.button("♻️ Vider caches et relancer"):
+    st.cache_data.clear()
+    st.experimental_rerun()
