@@ -21,8 +21,8 @@ st.set_page_config(page_title="Items — Doublons & Saisie", page_icon="🧠", l
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-ITEMS_CSV = DATA_DIR / "items.csv"   # utilisé si export.csv absent
-EXPORT_CSV = DATA_DIR / "export.csv" # préféré s'il existe
+ITEMS_CSV = DATA_DIR / "items.csv"   # fallback si export.csv absent
+EXPORT_CSV = DATA_DIR / "export.csv" # lu en priorité s'il existe
 
 # -------- Utilitaires texte --------
 def strip_accents(s: str) -> str:
@@ -55,7 +55,7 @@ def ensure_items_file():
         df.to_csv(ITEMS_CSV, index=False, encoding="utf-8")
 
 def auto_detect_sep(sample_path: Path) -> str:
-    """Détecte le séparateur probable (';' ou ',') sur quelques lignes."""
+    """Détecte ';' ou ',' sur quelques lignes."""
     try:
         with open(sample_path, "r", encoding="utf-8", errors="ignore") as f:
             head = "".join([next(f) for _ in range(5)])
@@ -67,7 +67,7 @@ def auto_detect_sep(sample_path: Path) -> str:
 def load_items() -> tuple[pd.DataFrame, str]:
     """
     Charge d'abord data/export.csv s'il existe, sinon data/items.csv.
-    Gère séparateur et encodage, normalise + colonnes auxiliaires.
+    Gère séparateur/encodage, normalise + colonnes auxiliaires.
     Retourne (df, source_label).
     """
     # 1) Choisir la source
@@ -94,7 +94,7 @@ def load_items() -> tuple[pd.DataFrame, str]:
 
     # 3) Renommage de colonnes si l’export n’a pas les mêmes noms
     rename_map = {
-        # FR courants
+        # FR courants et variantes
         "nom": "item_name", "name": "item_name",
         "libelle": "french_name", "libellé": "french_name",
         "unite": "uom_name", "uom": "uom_name",
@@ -123,11 +123,12 @@ def load_items() -> tuple[pd.DataFrame, str]:
     for c in df.columns:
         df[c] = df[c].astype(str).fillna("").str.strip()
 
-    # 6) search_text robuste
+    # 6) search_text robuste (Series garantie)
     text_cols = ["item_name","french_name","reference","uom_name","type_name","sub_category_name","category_name"]
-    if len(text_cols) > 0 and not df.empty:
-        tmp = df[text_cols].apply(lambda r: " ".join([str(x) for x in r.values]), axis=1)
-        df["search_text"] = tmp.astype(str).str.lower()
+    if not df.empty:
+        # astype(str) + agg(' '.join, axis=1) retourne une Series
+        tmp = df[text_cols].astype(str).agg(' '.join, axis=1)
+        df["search_text"] = tmp.str.lower()
     else:
         df["search_text"] = ""
 
@@ -140,7 +141,7 @@ def load_items() -> tuple[pd.DataFrame, str]:
 def save_items(df: pd.DataFrame):
     """
     Sauvegarde dans items.csv (base locale), sans les colonnes techniques.
-    Remarque: on lit prioritairement export.csv; la sauvegarde reste dans items.csv pour ne pas altérer ton export d’origine.
+    Remarque: on lit prioritairement export.csv; la sauvegarde reste dans items.csv pour ne pas altérer l’export d’origine.
     """
     out = df.copy()
     for col in ["search_text","_item_name_norm","_ref_root"]:
@@ -359,7 +360,7 @@ def detect_duplicate_groups(df: pd.DataFrame, block_cols: list, threshold=0.82, 
 st.title("🧠 Items — Saisie & Détection de doublons (LOCAL)")
 
 # Charger les données et afficher la source
-df_all, source_label = load_items()
+df_all, source_label = load_items()           # ✅ déballage correct
 st.caption(f"📂 Source chargée : **{source_label}** • lignes: {len(df_all)}")
 
 # -------- Filtres --------
