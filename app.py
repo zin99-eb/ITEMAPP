@@ -53,28 +53,42 @@ def ensure_items_file():
 
 @st.cache_data(ttl=600)
 def load_items() -> pd.DataFrame:
+    """Lecture robuste + normalisation + clés auxiliaires.
+       Corrige le cas DataFrame vide et force les types 'str' pour éviter l'AttributeError sur .str.lower()."""
     ensure_items_file()
     try:
         df = pd.read_csv(ITEMS_CSV, dtype=str, encoding="utf-8")
     except UnicodeDecodeError:
         df = pd.read_csv(ITEMS_CSV, dtype=str, encoding="latin-1")
-    if len(df) == 0:
+
+    if df is None or len(df) == 0:
         df = pd.DataFrame(columns=COLUMNS)
 
-    # Normalisation rapide
+    # Normalisation rapide (tout en texte)
     for c in df.columns:
         df[c] = df[c].astype(str).fillna("").str.strip()
 
-    # Champ de recherche
-    text_cols = [c for c in ["item_name","french_name","reference","uom_name","type_name","sub_category_name","category_name"] if c in df.columns]
-    if len(text_cols) > 0:
-        df["search_text"] = df[text_cols].apply(lambda r: " ".join(r.values), axis=1).str.lower()
+    # Champ de recherche (robuste aux df vides et dtypes)
+    text_cols = [c for c in ["item_name", "french_name", "reference", "uom_name",
+                             "type_name", "sub_category_name", "category_name"]
+                 if c in df.columns]
+
+    if len(text_cols) > 0 and not df.empty:
+        tmp = df[text_cols].apply(lambda r: " ".join([str(x) for x in r.values]), axis=1)
+        df["search_text"] = tmp.astype(str).str.lower()
     else:
         df["search_text"] = ""
 
-    # Clés auxiliaires pour détection
-    df["_item_name_norm"] = df["item_name"].map(clean_text) if "item_name" in df.columns else ""
-    df["_ref_root"] = df["reference"].map(ref_root) if "reference" in df.columns else ""
+    # Clés auxiliaires pour détection (toujours présentes, même si vide)
+    if "item_name" in df.columns:
+        df["_item_name_norm"] = df["item_name"].map(lambda x: clean_text(str(x)))
+    else:
+        df["_item_name_norm"] = ""
+
+    if "reference" in df.columns:
+        df["_ref_root"] = df["reference"].map(lambda x: ref_root(str(x)))
+    else:
+        df["_ref_root"] = ""
 
     return df
 
@@ -108,7 +122,7 @@ def apply_filters(df, f_company, f_type, f_cat):
 
 # -------- Détection doublons pour une nouvelle saisie --------
 def find_duplicates_for_entry(df: pd.DataFrame, row: dict, topn=10, threshold=0.82):
-    """Retourne candidats doublons triés (DataFrame) — fuzzy + boost ref_root + match exact item_name"""
+    """Retourne candidats doublons triés — règle 'item_name identique' + fuzzy + boost ref_root."""
     if len(df) == 0:
         return pd.DataFrame(columns=COLUMNS + ["score","match_rule"])
 
@@ -118,7 +132,7 @@ def find_duplicates_for_entry(df: pd.DataFrame, row: dict, topn=10, threshold=0.
     exact_name_matches["score"] = 1.0
     exact_name_matches["match_rule"] = "item_name_identique"
 
-    # 2) Fuzzy global (si topn non déjà saturé)
+    # 2) Fuzzy global
     query = " ".join([
         row.get("item_name",""),
         row.get("french_name",""),
@@ -146,6 +160,7 @@ def find_duplicates_for_entry(df: pd.DataFrame, row: dict, topn=10, threshold=0.
         rr_new = ref_root(row.get("reference",""))
         if rr_new:
             same_ref = df.iloc[idxs]["_ref_root"] == rr_new
+            # mask bool de même longueur que fuzzy_df
             fuzzy_df.loc[same_ref.values, "score"] = fuzzy_df.loc[same_ref.values, "score"].clip(upper=1.0)
 
     # 3) Fusionner exact + fuzzy et re-trier
