@@ -4,7 +4,7 @@
 # Auteur : Zineb FAKKAR – Janv 2026
 # ================================================================
 
-# Core imports (gardés au minimum)
+# Core imports
 import streamlit as st
 import pandas as pd
 import re
@@ -30,13 +30,22 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
 
-# Diagnostic rapide
-st.write("📁 BASE_DIR:", str(BASE_DIR))
-try:
-    st.write("📁 Contenu racine:", os.listdir(BASE_DIR))
-except Exception:
-    st.write("Contenu racine: impossible à lister")
-st.write("📁 Contenu /data:", os.listdir(DATA_DIR) if DATA_DIR.exists() else "data/ introuvable")
+# ============= Mode debug léger (optionnel) =========================
+st.sidebar.markdown("### 🛠️ Outils")
+debug_mode = st.sidebar.checkbox("Afficher le diagnostic de démarrage", value=False)
+if st.sidebar.button("♻️ Vider caches et relancer"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.experimental_rerun()
+
+if debug_mode:
+    st.write("📁 BASE_DIR:", str(BASE_DIR))
+    st.write("📁 data/ existe ?", DATA_DIR.exists())
+    if DATA_DIR.exists():
+        try:
+            st.write("📁 Contenu data/:", [p.name for p in DATA_DIR.iterdir()])
+        except Exception as e:
+            st.write("data/: erreur:", str(e))
 
 # ============= CSS personnalisé =====================================
 st.markdown("""
@@ -74,21 +83,30 @@ def show_errors(section):
             traceback.format_exception(type(e), e, e.__traceback__)
         ))
 
-# ============= Optimisation: Définition précoce des caches ===========
+# ============= Caches & utilitaires =================================
 @st.cache_data(ttl=3600, max_entries=10, show_spinner=False)
 def load_csv_cached(file_or_path):
-    """Cache fort pour éviter les rechargements"""
-    # Supporte file_uploader et chemin local
-    return pd.read_csv(file_or_path, sep=";", dtype=str, encoding="utf-8")
+    """Lecture CSV robuste (séparateur ;, encodage utf-8; fallback latin-1/,)"""
+    try:
+        return pd.read_csv(file_or_path, sep=";", dtype=str, encoding="utf-8")
+    except UnicodeDecodeError:
+        return pd.read_csv(file_or_path, sep=";", dtype=str, encoding="latin-1")
+    except Exception:
+        return pd.read_csv(file_or_path, sep=",", dtype=str, encoding="utf-8")
 
 @st.cache_resource(show_spinner=False)
 def get_fuzzy_processor():
-    """Charge rapide et mise en cache de rapidfuzz"""
+    """Charge et cache rapidfuzz"""
     try:
         from rapidfuzz import process, fuzz
         return process, fuzz, True
     except Exception:
         return None, None, False
+
+# préprocess texte (cache data au niveau module)
+@st.cache_data(ttl=300, show_spinner=False)
+def preprocess_search_texts(texts):
+    return [clean_text(t) for t in texts]
 
 # ============= Fonctions de base ====================================
 def strip_accents(s: str) -> str:
@@ -134,125 +152,98 @@ def ref_root(r: str) -> str:
     r = re.sub(r'[-_/\.]', '', r)
     return r
 
-# ============= Fonctions optimisées ==================================
+# ============= Normalisation colonnes ===============================
 def normalize_columns_optimized(df: pd.DataFrame) -> pd.DataFrame:
-    """Version vectorisée pour plus de rapidité"""
-    # Renommage efficace
+    """Vectorisé pour vitesse"""
     rename_dict = {'name': 'item_name', 'nom': 'item_name', 'libelle': 'item_name'}
     rename_dict = {k: v for k, v in rename_dict.items() if k in df.columns and v not in df.columns}
     if rename_dict:
         df = df.rename(columns=rename_dict)
-    
-    # Colonnes standard
+
     standard_cols = [
         'id','reference','item_name','french_name','uom_name',
         'type_name','sub_category_name','category_name','company_name',
         'last_price','last_use','created_at'
     ]
-    
-    # Garder uniquement les colonnes existantes
     existing_cols = [c for c in standard_cols if c in df.columns]
     df = df[existing_cols] if existing_cols else df
-    
-    # Vectoriser les opérations de nettoyage
+
     for col in df.columns:
         df[col] = df[col].astype(str).fillna("").str.strip()
-    
-    # Créer le champ de recherche (vectorisé)
-    text_cols = ["item_name", "french_name", "reference", "uom_name", 
+
+    text_cols = ["item_name", "french_name", "reference", "uom_name",
                  "type_name", "sub_category_name", "category_name"]
     text_cols = [c for c in text_cols if c in df.columns]
-    
+
     if text_cols:
-        df["search_text"] = df[text_cols].apply(
-            lambda row: " ".join(row.values), axis=1
-        ).str.lower()
+        df["search_text"] = df[text_cols].apply(lambda row: " ".join(row.values), axis=1).str.lower()
     else:
         df["search_text"] = ""
-    
+
     return df
 
 @st.cache_data(show_spinner=False)
 def load_csv(file_or_path):
-    """Wrapper avec cache optimisé"""
     df = load_csv_cached(file_or_path)
     return normalize_columns_optimized(df)
 
 # ============= Search Engine Optimisé ================================
 class SearchEngine:
-    """Moteur de recherche optimisé avec cache"""
+    """Moteur de recherche optimisé avec cache mémoire interne"""
     def __init__(self, df):
         self.df = df
         self._cache = {}
-        
-    @staticmethod
-    @st.cache_data(ttl=300, show_spinner=False)
-    def preprocess_search_texts(texts):
-        """Pré-calcul des textes nettoyés"""
-        return [clean_text(t) for t in texts]
-    
+
     def fuzzy_search_optimized(self, query: str, topn=10) -> pd.DataFrame:
-        """Recherche optimisée avec cache multi-niveaux"""
         cache_key = f"{query}_{topn}"
-        
         if cache_key in self._cache:
             return self._cache[cache_key]
-        
         if len(self.df) == 0:
             return pd.DataFrame()
-        
+
         process, fuzz, FUZZY_OK = get_fuzzy_processor()
         if not FUZZY_OK:
             return pd.DataFrame()
-        
+
         q = expand_query(query)
         if not q:
             return pd.DataFrame()
-        
-        # Pré-calcul des choix
+
         choices = self.df["search_text"].tolist()
-        cleaned_choices = SearchEngine.preprocess_search_texts(choices)
-        
-        # Recherche avec limite intelligente
-        limit = min(topn * 3, len(choices))  # Recherche large puis filtrage
-        
+        cleaned_choices = preprocess_search_texts(choices)
+
+        limit = min(topn * 3, len(choices))
         matches = process.extract(
-            q, 
-            cleaned_choices, 
-            scorer=fuzz.token_set_ratio, 
+            q,
+            cleaned_choices,
+            scorer=fuzz.token_set_ratio,
             limit=limit,
-            score_cutoff=50  # Élimine les très mauvais matches
+            score_cutoff=50
         )
-        
         if not matches:
             return pd.DataFrame()
-        
-        # Trier et limiter
+
         matches.sort(key=lambda x: x[1], reverse=True)
         idxs = [m[2] for m in matches[:topn]]
         scores = [m[1]/100 for m in matches[:topn]]
-        
+
         res = self.df.iloc[idxs].copy()
         res["score"] = scores
-        
-        # Cache le résultat
         self._cache[cache_key] = res
-        
         return res.sort_values("score", ascending=False)
 
-# ============= Initialisation session state =========================
+# ============= Session state init ===================================
 def init_session_state():
-    """Initialise toutes les variables de session"""
-    if 'df_loaded' not in st.session_state:
-        st.session_state.df_loaded = None
-    if 'df_current' not in st.session_state:
-        st.session_state.df_current = pd.DataFrame()
-    if 'suggestions' not in st.session_state:
-        st.session_state.suggestions = pd.DataFrame()
-    if 'search_engine' not in st.session_state:
-        st.session_state.search_engine = None
-    if 'last_file_hash' not in st.session_state:
-        st.session_state.last_file_hash = None
+    keys_defaults = {
+        'df_loaded': None,
+        'df_current': pd.DataFrame(),
+        'suggestions': pd.DataFrame(),
+        'search_engine': None,
+        'last_file_hash': None
+    }
+    for k, v in keys_defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 # ============= Synonymes ============================================
 SYNONYMS = {
@@ -272,25 +263,21 @@ def expand_query(q: str) -> str:
     for k, vals in SYNONYMS.items():
         if k in ql or any(v in ql for v in vals):
             extra.extend([k]+vals)
-    # Note: f_company, f_type, f_cat sont définis plus tard
     return (ql + " " + " ".join(sorted(set(extra)))).strip()
 
-# ============= DSU pour détection doublons =========================
+# ============= DSU (doublons) =======================================
 class DSU:
     def __init__(self, n):
         self.p = list(range(n))
         self.r = [0]*n
-    
     def find(self, x):
         while self.p[x] != x:
             self.p[x] = self.p[self.p[x]]
             x = self.p[x]
         return x
-    
     def union(self, a, b):
         ra, rb = self.find(a), self.find(b)
-        if ra == rb:
-            return
+        if ra == rb: return
         if self.r[ra] < self.r[rb]:
             self.p[ra] = rb
         elif self.r[ra] > self.r[rb]:
@@ -348,7 +335,7 @@ st.markdown("<div class='big'>🧠 Assistant IA – Version Optimisée</div>", u
 st.markdown("<div class='sub'>Entrez une description, l'outil propose l'item le plus pertinent.</div>", unsafe_allow_html=True)
 
 # ================================================================
-#       Chargement fichier CSV Optimisé
+#       Chargement fichier CSV
 # ================================================================
 st.sidebar.markdown("### 📥 Importer un fichier CSV")
 uploaded = st.sidebar.file_uploader(
@@ -359,11 +346,9 @@ uploaded = st.sidebar.file_uploader(
 
 with st.spinner("🔍 Préparation de l'application..."):
     if uploaded:
-        # Vérifier si le fichier a changé
         file_hash = hash(uploaded.getvalue())
         if (st.session_state.df_loaded is None or 
             st.session_state.get('last_file_hash') != file_hash):
-            
             with st.spinner("📊 Chargement et traitement des données..."):
                 df = load_csv(uploaded)
                 st.session_state.df_loaded = df
@@ -372,7 +357,6 @@ with st.spinner("🔍 Préparation de l'application..."):
                 st.success(f"✅ {len(df)} items chargés")
         else:
             df = st.session_state.df_loaded
-    
     elif (DATA_DIR / "export.csv").exists():
         if st.session_state.df_loaded is None:
             with st.spinner("📊 Chargement depuis data/export.csv..."):
@@ -399,7 +383,6 @@ def uniq(df, col):
     vals = sorted([x for x in s.unique() if x])
     return [""] + vals
 
-# Variables globales pour les filtres
 f_company = ""
 f_type = ""
 f_cat = ""
@@ -434,15 +417,13 @@ left, right = st.columns([1.25, 0.75], gap="large")
 
 with left:
     st.markdown("<div class='section-title'>✍️ Description</div>", unsafe_allow_html=True)
-    
     query = st.text_area(
         "Saisissez ce que vous cherchez :", 
         placeholder="Ex : câble fibre 1.5mm 100m",
         key="search_query"
     )
-    
     topn = st.slider("Nombre de suggestions", 3, 30, 8, key="top_n_slider")
-    
+
     col1, col2 = st.columns([1, 3])
     with col1:
         search_clicked = st.button(
@@ -451,7 +432,7 @@ with left:
             use_container_width=True,
             key="search_button"
         )
-    
+
     if search_clicked and query.strip():
         with st.spinner("🔍 Recherche en cours..."):
             if st.session_state.search_engine:
@@ -459,7 +440,7 @@ with left:
                 st.session_state.suggestions = suggestions
             else:
                 st.error("⚠️ Moteur de recherche non initialisé")
-    
+
     suggestions = st.session_state.suggestions
     if len(suggestions) > 0:
         st.subheader("🎯 Suggestions")
@@ -467,7 +448,7 @@ with left:
                      'type_name','sub_category_name','category_name','last_price','score']
         view_cols = [c for c in view_cols if c in suggestions.columns]
         st.dataframe(suggestions[view_cols], hide_index=True, use_container_width=True)
-        
+
         b = BytesIO()
         suggestions[view_cols].to_csv(b, index=False, encoding="utf-8")
         b.seek(0)
@@ -485,20 +466,18 @@ with right:
         opts = [f"{r.item_name} | {r.reference}" for _, r in suggestions.iterrows()]
         choice = st.selectbox("Choisissez un item", opts, index=0, key="item_choice")
         row = suggestions.iloc[opts.index(choice)]
-        
-        # Description standard simple
+
         std = f"{row.get('item_name','')} / {row.get('french_name','')}".strip(" / ")
         st.markdown("**📋 Description standard**")
         st.markdown(f"<div class='card'>{std}</div>", unsafe_allow_html=True)
-        
+
         st.markdown("**🔖 Attributs clés**")
         st.code(
             f"Ref: {row.get('reference','')} | UoM: {row.get('uom_name','')}\n"
             f"Type: {row.get('type_name','')} | Sous-cat: {row.get('sub_category_name','')} | "
             f"Cat: {row.get('category_name','')}"
         )
-        
-        # Incohérences détectées
+
         issues = detect_issues(query, row)
         if issues:
             st.markdown("<span class='badge-yellow'>⚠️ Incohérences possibles</span>", unsafe_allow_html=True)
@@ -506,40 +485,33 @@ with right:
                 st.write("- " + i)
         else:
             st.markdown("<span class='badge-green'>✅ Description cohérente</span>", unsafe_allow_html=True)
-        
+
         st.text_input("Copier cette description :", value=std, key="copy_desc")
 
 # ================================================================
 #       ANALYTICS & PERFORMANCE
 # ================================================================
 def show_analytics(df):
-    """Affiche des statistiques sur les données"""
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📊 Analytics")
-    
     if len(df) > 0:
-        # Stats rapides
         total_items = len(df)
         unique_companies = df['company_name'].nunique() if 'company_name' in df.columns else 0
         unique_categories = df['category_name'].nunique() if 'category_name' in df.columns else 0
-        
         st.sidebar.metric("Items totaux", total_items)
         st.sidebar.metric("Sociétés", unique_companies)
         st.sidebar.metric("Catégories", unique_categories)
-        
-        # Top catégories
         if 'category_name' in df.columns:
             top_cats = df['category_name'].value_counts().head(5)
             st.sidebar.markdown("**Top catégories:**")
             for cat, count in top_cats.items():
                 st.sidebar.text(f"• {cat}: {count}")
 
-# Appeler analytics
 if st.session_state.df_loaded is not None:
     show_analytics(st.session_state.df_loaded)
 
 # ================================================================
-#       Détection des incohérences – sur tout le dataset
+#       Incohérences dataset
 # ================================================================
 st.markdown("---")
 st.markdown("## ✅ Incohérences dans la base")
@@ -578,94 +550,70 @@ if st.button("🔍 Scanner les incohérences", key="scan_issues"):
                 st.download_button("⬇️ Exporter (CSV)", data=b.getvalue(), file_name="quality_issues.csv", mime="text/csv", key="export_issues")
 
 # ================================================================
-#       Détection de doublons – full fuzzy
+#       Doublons (fuzzy)
 # ================================================================
 def detect_duplicate_groups_optimized(frame: pd.DataFrame,
                                      block_cols: list[str],
                                      similarity_threshold: float = 0.82,
                                      max_block_size: int = 2500):
-    """Version optimisée avec pandas vectorisé"""
     if len(frame) == 0:
         return pd.DataFrame(), {}
-    
     process, fuzz, FUZZY_OK = get_fuzzy_processor()
     if not FUZZY_OK:
         return pd.DataFrame(), {}
-    
+
     work = frame.copy().reset_index(drop=True)
     work['_rowid'] = range(len(work))
-    
-    # Pré-calcul des textes pour comparaison
     work['dupe_text'] = work.apply(build_dupe_text, axis=1)
-    
-    # Blocage intelligent
+
     available = [c for c in block_cols if c in work.columns]
     if not available:
         work['_block'] = 'ALL'
         available = ['_block']
-    
+
     groups_map = {}
     group_records = []
     next_gid = 1
-    
-    # Utiliser pandas groupby optimisé
+
     for _, block in work.groupby(available, dropna=False):
         block = block.reset_index(drop=True)
         if len(block) <= 1:
             continue
-        
-        # Détection par lots pour les grands groupes
+
         if len(block) > max_block_size:
-            # Hachage pour subdivision
             block['_hash'] = block['dupe_text'].apply(lambda s: hash(s) % 10)
             subgroups = [g for _, g in block.groupby('_hash')]
         else:
             subgroups = [block]
-        
+
         for sub in subgroups:
             if len(sub) <= 1:
                 continue
-            
-            # Matrice de similarité optimisée
             n = len(sub)
-            texts = sub['dupe_text'].tolist() 
-            
-            # DSU optimisé
+            texts = sub['dupe_text'].tolist()
             dsu = DSU(n)
-            
-            # Comparaisons par paires avec seuil précoce
             for i in range(n):
                 for j in range(i + 1, n):
-                    # Vérification rapide des références d'abord
                     ri = ref_root(sub.iloc[i]['reference'])
                     rj = ref_root(sub.iloc[j]['reference'])
-                    
                     if ri and rj and ri == rj:
                         dsu.union(i, j)
                         continue
-                    
-                    # Calcul fuzzy seulement si nécessaire
                     s = fuzz.token_set_ratio(texts[i], texts[j]) / 100.0
                     if s >= similarity_threshold:
                         dsu.union(i, j)
-            
-            # Composants
+
             comp = {}
             for i in range(n):
                 r = dsu.find(i)
                 comp.setdefault(r, []).append(i)
-            
-            # Créer les groupes
+
             for members in comp.values():
                 if len(members) <= 1:
                     continue
-                
                 group_df = sub.iloc[members].copy()
-                
-                # Représentant (référence la plus complète)
                 group_df['ref_len'] = group_df['reference'].fillna('').str.len()
                 rep = group_df.loc[group_df['ref_len'].idxmax()]
-                
                 groups_map[next_gid] = group_df['_rowid'].tolist()
                 group_records.append({
                     "group_id": next_gid,
@@ -675,11 +623,10 @@ def detect_duplicate_groups_optimized(frame: pd.DataFrame,
                     "representative_id": rep.get('id', '')
                 })
                 next_gid += 1
-    
+
     groups_df = pd.DataFrame(group_records)
     if len(groups_df) > 0:
         groups_df = groups_df.sort_values('size', ascending=False).reset_index(drop=True)
-    
     return groups_df, groups_map
 
 st.markdown("---")
@@ -709,7 +656,6 @@ if st.button("🔎 Détecter les doublons"):
                 b1.seek(0)
                 st.download_button("⬇️ Export groupes (CSV)", data=b1.getvalue(), file_name="dupes_groups.csv", mime="text/csv")
 
-                # Membres
                 st.markdown("### 👥 Membres de tous les groupes")
                 cols_view = [c for c in ['id','reference','item_name','french_name','uom_name','type_name','sub_category_name','category_name','last_price'] if c in df_current.columns]
                 all_rows = []
@@ -747,47 +693,42 @@ def norm_uom(u: str) -> str:
     }
     return MAP.get(u, u)
 
-def composite_score_fuzzy(a: pd.Series, b: pd.Series) -> tuple[float, dict]:
+def composite_score_fuzzy(a: pd.Series, b: pd.Series):
     process, fuzz, FUZZY_OK = get_fuzzy_processor()
     if not FUZZY_OK:
         return 0.0, {}
-    
-    # Fuzzy (search_text)
+
     s_fuzzy = fuzz.token_set_ratio(
         clean_text(a.get('search_text','')),
         clean_text(b.get('search_text',''))
     ) / 100.0
-    
-    # Jaccard
+
     s_jacc = jaccard(
         token_set(a.get('item_name','') + " " + a.get('french_name','')),
         token_set(b.get('item_name','') + " " + b.get('french_name',''))
     )
-    
-    # Phonétique (premier mot)
+
     na = clean_text(a.get('item_name',''))
     nb = clean_text(b.get('item_name',''))
     sa = soundex(na.split()[0]) if na else ""
     sb = soundex(nb.split()[0]) if nb else ""
     s_phon = 1.0 if sa and sb and sa == sb else 0.0
-    
-    # Référence root
+
     ra = ref_root(a.get('reference',''))
     rb = ref_root(b.get('reference',''))
     s_ref = 1.0 if (ra and rb and ra == rb) else 0.0
-    
-    # Attributs (type/cat/uom + signatures numériques)
+
     type_ok = clean_text(a.get('type_name','')) == clean_text(b.get('type_name',''))
     cat_ok = clean_text(a.get('category_name','')) == clean_text(b.get('category_name',''))
     uom_ok = norm_uom(a.get('uom_name','')) == norm_uom(b.get('uom_name',''))
-    
+
     sig_a, sig_b = numeric_signature(a), numeric_signature(b)
     num_ok = True
     if sig_a['cal_mm2'] is not None and sig_b['cal_mm2'] is not None:
         num_ok &= abs(sig_a['cal_mm2'] - sig_b['cal_mm2']) <= 0.01
     if sig_a['len_m'] is not None and sig_b['len_m'] is not None:
         num_ok &= abs(sig_a['len_m'] - sig_b['len_m']) <= 0.01
-    
+
     s_attr = (1.0 if type_ok else 0.0)*0.4 + (1.0 if cat_ok else 0.0)*0.4 + (1.0 if uom_ok else 0.0)*0.2
     if not num_ok: 
         s_attr *= 0.7
@@ -795,7 +736,7 @@ def composite_score_fuzzy(a: pd.Series, b: pd.Series) -> tuple[float, dict]:
     weights = st.session_state.get('md_weights', {
         'fuzzy': 0.40, 'jacc': 0.25, 'phon': 0.15, 'ref': 0.10, 'attr': 0.10
     })
-    
+
     score = (
         weights['fuzzy'] * s_fuzzy + 
         weights['jacc'] * s_jacc + 
@@ -803,7 +744,7 @@ def composite_score_fuzzy(a: pd.Series, b: pd.Series) -> tuple[float, dict]:
         weights['ref'] * s_ref + 
         weights['attr'] * s_attr
     )
-    
+
     details = {
         "s_fuzzy": s_fuzzy,
         "s_jaccard": s_jacc,
@@ -811,13 +752,11 @@ def composite_score_fuzzy(a: pd.Series, b: pd.Series) -> tuple[float, dict]:
         "s_ref": s_ref,
         "s_attr": s_attr
     }
-    
     return score, details
 
 def choose_representative(group_df: pd.DataFrame) -> pd.Series:
     g = group_df.copy()
     g['ref_len'] = g['reference'].fillna('').str.len()
-    # priorité à la référence renseignée puis au prix non nul
     try:
         g['_price'] = pd.to_numeric(g.get('last_price',''), errors='coerce')
     except:
@@ -862,25 +801,22 @@ if st.button("🧠 Générer le plan de fusion"):
             st.info("Pas assez d'items pour proposer des fusions.")
         else:
             work = df_current.copy().reset_index(drop=True)
-
-            # groupage simple par racine de référence + famille (BK1/BK3)
             work['BK1'] = work.apply(lambda r: "|".join([
                 clean_text(r.get('type_name','')),
                 clean_text(r.get('category_name','')),
                 norm_uom(r.get('uom_name',''))
             ]) or "BK1", axis=1)
-            
             work['BK3'] = work['reference'].apply(ref_root)
 
             groups_records = []
             members_records = []
             gid = 1
-            
+
             for _, block in work.groupby(['BK1','BK3'], dropna=False):
                 block = block.reset_index(drop=True)
                 if len(block) < 2: 
                     continue
-                
+
                 rep = choose_representative(block)
                 rep_id = rep.get('id', str(rep.name))
                 rep_ref = rep.get('reference','')
@@ -916,7 +852,6 @@ if st.button("🧠 Générer le plan de fusion"):
                     row = block.iloc[j]
                     action = "review"
                     reason = []
-                    
                     if s >= threshold_md and gap >= strong_gap:
                         action = "merge_strong"
                         reason.append("score>=seuil & gap strong")
@@ -950,7 +885,6 @@ if st.button("🧠 Générer le plan de fusion"):
                         "s_ref": round(det["s_ref"],4),
                         "s_attr": round(det["s_attr"],4),
                     })
-
                 gid += 1
 
             groups_df = pd.DataFrame(groups_records).sort_values('size', ascending=False)
@@ -963,15 +897,9 @@ if st.button("🧠 Générer le plan de fusion"):
                 st.dataframe(groups_df, use_container_width=True)
                 st.markdown("### 🧩 Plan de fusion (membres)")
                 st.dataframe(plan_df, use_container_width=True)
-                
-                b1 = BytesIO()
-                groups_df.to_csv(b1, index=False, encoding='utf-8')
-                b1.seek(0)
-                
-                b2 = BytesIO()
-                plan_df.to_csv(b2, index=False, encoding='utf-8')
-                b2.seek(0)
-                
+
+                b1 = BytesIO(); groups_df.to_csv(b1, index=False, encoding='utf-8'); b1.seek(0)
+                b2 = BytesIO(); plan_df.to_csv(b2, index=False, encoding='utf-8'); b2.seek(0)
                 st.download_button("⬇️ Export Groupes (CSV)", data=b1.getvalue(), file_name="md_groups.csv", mime="text/csv")
                 st.download_button("⬇️ Export Plan (CSV)", data=b2.getvalue(), file_name="md_to_merge.csv", mime="text/csv")
 
@@ -979,7 +907,7 @@ if st.button("🧠 Générer le plan de fusion"):
                 st.session_state["md_plan_df"] = plan_df
 
 # ================================================================
-#       Obsolescence (items peu/plus utilisés)
+#       Obsolescence
 # ================================================================
 st.markdown("---")
 st.markdown("## 🕰️ Obsolescence")
@@ -997,20 +925,15 @@ if st.button("🗑️ Lister les obsolètes"):
         cutoff = pd.Timestamp.now(tz='UTC') - pd.DateOffset(months=months)
         obso = base[(base['_last_dt'].isna()) | (base['_last_dt'] < cutoff)]
         out = obso.copy()
-        
         try:
             out['_last_dt_display'] = out['_last_dt'].dt.tz_localize(None)
         except Exception:
             out['_last_dt_display'] = out['_last_dt']
-        
         show_cols = ['id','reference','item_name','last_use','created_at','_last_dt_display']
         cols_present = [c for c in show_cols if c in out.columns]
-        
         if len(out) > 0:
             st.dataframe(out[cols_present], use_container_width=True)
-            b = BytesIO()
-            out.to_csv(b, index=False, encoding='utf-8')
-            b.seek(0)
+            b = BytesIO(); out.to_csv(b, index=False, encoding='utf-8'); b.seek(0)
             st.download_button("⬇️ Export obsolètes (CSV)", data=b.getvalue(), file_name="obsolete_items.csv", mime="text/csv")
         else:
             st.success("✅ Aucun item obsolète trouvé.")
@@ -1061,37 +984,23 @@ if st.button("🧽 Proposer des libellés standardisés"):
             preview = df_current[preview_cols].copy() if preview_cols else df_current[['item_name','french_name']].copy()
             preview['item_name_std'] = preview['item_name'].apply(suggest_standard_name)
             st.dataframe(preview.head(50), use_container_width=True)
-            b = BytesIO()
-            preview.to_csv(b, index=False, encoding="utf-8")
-            b.seek(0)
+            b = BytesIO(); preview.to_csv(b, index=False, encoding="utf-8"); b.seek(0)
             st.download_button("⬇️ Export libellés (CSV)", data=b.getvalue(), file_name="item_names_standard.csv", mime="text/csv")
 
 # ================================================================
 #       EXPORT AVANCÉ
 # ================================================================
 def export_advanced_options():
-    """Options d'export avancées"""
     with st.expander("🚀 Export avancé"):
         col1, col2 = st.columns(2)
-        
         with col1:
-            export_format = st.selectbox(
-                "Format",
-                ["CSV", "Excel", "JSON"],
-                index=0
-            )
-        
+            export_format = st.selectbox("Format", ["CSV", "Excel", "JSON"], index=0)
         with col2:
-            encoding = st.selectbox(
-                "Encodage",
-                ["utf-8", "utf-8-sig", "latin-1"],
-                index=0
-            )
-        
+            encoding = st.selectbox("Encodage", ["utf-8", "utf-8-sig", "latin-1"], index=0)
+
         if st.button("📤 Exporter toutes les données"):
             if len(df_current) > 0:
                 buffer = BytesIO()
-                
                 if export_format == "Excel":
                     df_current.to_excel(buffer, index=False, engine='openpyxl')
                     mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1104,9 +1013,7 @@ def export_advanced_options():
                     buffer.write(df_current.to_csv(index=False, encoding=encoding).encode(encoding))
                     mime_type = "text/csv"
                     file_ext = "csv"
-                
                 buffer.seek(0)
-                
                 st.download_button(
                     label=f"⬇️ Télécharger ({export_format})",
                     data=buffer,
@@ -1114,25 +1021,19 @@ def export_advanced_options():
                     mime=mime_type
                 )
 
-# Export avancé
 export_advanced_options()
 
 # ================================================================
 #       BATCH PROCESSING
 # ================================================================
 def batch_processing():
-    """Traitement par lots"""
     with st.expander("⚙️ Traitement par lots"):
         st.markdown("**Correction automatique de formats**")
-        
         if st.button("🔄 Standardiser toutes les références"):
-            if len(df_current) > 0:
+            if len(df_current) > 0 and 'reference' in df_current.columns:
                 with st.spinner("Standardisation en cours..."):
-                    # Exemple: standardisation des références
-                    if 'reference' in df_current.columns:
-                        df_current['reference'] = df_current['reference'].str.upper().str.strip()
-                        st.success("Références standardisées")
-        
+                    df_current['reference'] = df_current['reference'].str.upper().str.strip()
+                    st.success("Références standardisées")
         if st.button("🧹 Nettoyer les UoM"):
             if len(df_current) > 0 and 'uom_name' in df_current.columns:
                 uom_mapping = {
@@ -1146,7 +1047,6 @@ def batch_processing():
                 df_current['uom_name'] = df_current['uom_name'].replace(uom_mapping)
                 st.success("UoM nettoyées")
 
-# Batch processing
 batch_processing()
 
 # ================================================================
@@ -1155,6 +1055,5 @@ batch_processing()
 st.markdown("---")
 st.success("Version **Optimisée** chargée ✔️ – Stable pour Streamlit Cloud. Performances améliorées.")
 
-# Footer
 st.sidebar.markdown("---")
 st.sidebar.caption("© 2026 - Assistant IA Items - v2.0")

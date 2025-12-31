@@ -1,4 +1,6 @@
 
 [server]
-enableCORS = true
+headless = true
 enableXsrfProtection = true
+maxUploadSize = 200
+``
