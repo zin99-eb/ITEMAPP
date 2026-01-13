@@ -1,711 +1,652 @@
-# ================================================================
-# Détection Intelligente de Doublons - CORRIGÉ V2
-# ================================================================
 
-import streamlit as st
-import pandas as pd
-import numpy as np
+# app.py
+# -------------------------------------------------------------------
+# Streamlit : Comparaison Stock (Total livré) vs Quantité Commandée (PO)
+# - Normalisation CSV POs (séparateurs ; , \t |)
+# - Sélection de feuille Excel (PO & Stock)
+# - Matching SAP Name (Stock) ~ Description (PO)
+# - Orphelins + meilleur match (affiche PO description + PO Item Code)
+# - Background image + overlay + ALERTES ROUGES + DÉTAILS (journal anomalies)
+# -------------------------------------------------------------------
+
+import io
 import re
 import unicodedata
-from typing import List, Dict, Tuple, Optional, Set
-import warnings
-warnings.filterwarnings('ignore')
-import json
+from datetime import datetime
 
-# -------- Configuration Streamlit --------
-st.set_page_config(
-    page_title="Détection Intelligente de Doublons", 
-    page_icon="🔍", 
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import numpy as np
+import pandas as pd
+import streamlit as st
+from difflib import SequenceMatcher
+import base64
+from pathlib import Path
 
-# -------- Noms de colonnes exacts --------
-COLUMNS_MAP = {
-    'id': 'id',
-    'reference': 'reference',
-    'name': 'name',
-    'french_name': 'french_name',
-    'status': 'status',
-    'uom_name': 'uom_name',
-    'type_name': 'type_name',
-    'sub_category_name': 'sub_category_name',
-    'category_name': 'category_name',
-    'last_use': 'last_use',
-    'last_price': 'last_price',
-    'requestor_name': 'requestor_name',
-    'company_name': 'company_name',
-    'department_name': 'department_name',
-    'created_at': 'created_at',
-    'updated_at': 'updated_at'
-}
+st.set_page_config(page_title="Comparaison Stock vs Commandes", layout="wide")
 
-EXPECTED_COLUMNS = list(COLUMNS_MAP.keys())
+# =========================
+# >>> THEME / BACKGROUND <<<
+# =========================
+def apply_background(image_path: str, overlay_rgba="rgba(255,255,255,0.85)"):
+    """
+    Applique une image de fond + un overlay translucide pour lire le contenu.
+    Place simplement l'image (PNG/JPG) dans le même dossier que app.py.
+    """
+    try:
+        img_path = Path(image_path)
+        if not img_path.exists():
+            st.warning(f"Image de background introuvable : {image_path}. Vérifie le nom/fichier.")
+            return
+        b64 = base64.b64encode(img_path.read_bytes()).decode()
+        st.markdown(
+            f"""
+            <style>
+            /* Fond principal de l'app */
+            .stApp {{
+                background: url("data:image/{img_path.suffix[1:]};base64,{b64}") no-repeat center center fixed;
+                background-size: cover;
+            }}
+            /* Overlay lisible sur le contenu principal */
+            .stApp .block-container {{
+                background: {overlay_rgba};
+                border-radius: 14px;
+                padding: 1.2rem 1.6rem;
+            }}
+            /* Sidebar lisible */
+            [data-testid="stSidebar"] {{
+                background: {overlay_rgba};
+            }}
+            /* Petits badges style chips */
+            .badge {{
+                display:inline-block; padding:0.15rem 0.5rem; border-radius:999px; font-weight:600; font-size:0.85rem;
+            }}
+            .badge-red  {{ background:#ffe5e5; color:#b00020; border:1px solid #ffb3b3; }}
+            .badge-green{{ background:#e7f8ed; color:#0b6b2a; border:1px solid #b3e6c5; }}
+            .badge-amber{{ background:#fff5e6; color:#8a4b00; border:1px solid #ffd9a6; }}
 
-# -------- Fonction pour détecter automatiquement les colonnes --------
-def detect_columns_automatically(df: pd.DataFrame) -> Dict[str, str]:
-    """Tente de détecter automatiquement quelle colonne correspond à quel champ"""
-    column_mapping = {}
-    
-    df_str = df.astype(str)
-    
-    detection_rules = {
-        'id': {
-            'keywords': ['id', 'identifiant', 'numéro', 'code'],
-            'type_check': lambda x: x.str.isnumeric().any() or x.str.match(r'^[A-Za-z0-9\-_]+$').any()
-        },
-        'reference': {
-            'keywords': ['référence', 'ref', 'code', 'sku', 'article'],
-            'type_check': lambda x: x.str.match(r'^[A-Za-z0-9\-_/.]+$').any()
-        },
-        'name': {
-            'keywords': ['nom', 'name', 'désignation', 'description', 'item', 'produit'],
-            'type_check': lambda x: x.str.len().mean() > 5 and x.str.contains(r'[a-zA-Z]').any()
-        }
-    }
-    
-    for col in df.columns:
-        col_lower = str(col).lower()
-        col_data = df_str[col]
-        
-        best_match = None
-        best_score = 0
-        
-        for field, rules in detection_rules.items():
-            score = 0
-            
-            for keyword in rules['keywords']:
-                if keyword in col_lower:
-                    score += 3
-            
+            /* Table: rendre la colonne Écart plus visible */
+            td[data-column="Écart = Stock - Commandé"] {{
+                font-weight: 700;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+    except Exception as e:
+        st.warning(f"Impossible d'appliquer le background: {e}")
+
+# 👉 Mets ici le nom exact de ton image
+apply_background("image_supply_chain_1.png", overlay_rgba="rgba(255,255,255,0.88)")
+
+# =========================
+# Helpers généraux (chargement/normalisation)
+# =========================
+def normalize_colnames(cols):
+    return [re.sub(r"\s+", " ", str(c)).strip() for c in cols]
+
+def detect_delimiter(sample_text: str):
+    candidates = [';', ',', '\t', '|']
+    counts = {sep: sample_text.count(sep) for sep in candidates}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else None
+
+def read_csv_safely(uploaded_file) -> pd.DataFrame:
+    """Lit un CSV en essayant encodages + séparateurs; normalise si une seule colonne avec ';'."""
+    if uploaded_file is None:
+        return None
+    raw = uploaded_file.getvalue()
+    # encodages courants
+    text = None
+    encoding = "utf-8"
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
+        try:
+            text = raw.decode(enc)
+            encoding = enc
+            break
+        except Exception:
+            continue
+    if text is None:
+        text = raw.decode("utf-8", errors="ignore")
+
+    sep = detect_delimiter(text)
+    df = None
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=sep, encoding=encoding, engine="python")
+    except Exception:
+        for s in (None, ';', ',', '\t', '|'):
             try:
-                if rules['type_check'](col_data):
-                    score += 2
-            except:
-                pass
-            
-            if score > best_score:
-                best_score = score
-                best_match = field
-        
-        if best_match and best_score >= 2:
-            column_mapping[best_match] = col
-    
-    return column_mapping
+                df = pd.read_csv(io.StringIO(text), sep=s, encoding=encoding, engine="python")
+                break
+            except Exception:
+                continue
 
-# -------- Base de Connaissance --------
-class DomainKnowledgeBase:
-    """Base de connaissance spécialisée pour vos domaines"""
-    
-    CATEGORY_KEYWORDS = {
-        'fibre_optique': {'fibre', 'optique', 'ftth', 'pon', 'splice', 'connecteur'},
-        'generateurs': {'générateur', 'groupe', 'electrogène', 'alternateur', 'diesel'},
-        'cables': {'câble', 'cordon', 'fil', 'rj45', 'cat5', 'cat6', 'coaxial'},
-        'connecteurs': {'connecteur', 'prise', 'fiche', 'jack', 'terminal', 'borne'},
-        'outillage': {'outil', 'pince', 'tournevis', 'perceuse', 'marteau', 'clé'},
-        'securite': {'caméra', 'cctv', 'détecteur', 'alarme', 'sirène', 'badge'},
-        'reseau': {'switch', 'routeur', 'firewall', 'point d\'accès', 'wifi'},
-    }
-    
-    @classmethod
-    def get_domain_group(cls, text: str) -> Optional[str]:
-        """Identifie le groupe de domaine d'un texte"""
-        if not text or pd.isna(text):
-            return None
-            
-        text_lower = str(text).lower()
-        
-        for domain, keywords in cls.CATEGORY_KEYWORDS.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    return domain  
+    # Si une seule colonne et présence de ';' -> re-split
+    if df is not None and df.shape[1] == 1:
+        col = df.columns[0]
+        if (';' in col) or df.iloc[:, 0].astype(str).str.contains(';').any():
+            split_df = df.iloc[:, 0].astype(str).str.split(';', expand=True)
+            first_row = split_df.iloc[0]
+            looks_like_header = any(h.lower() in ["item code", "qty", "created_at", "description"]
+                                    for h in first_row.astype(str).str.lower())
+            if looks_like_header:
+                split_df.columns = [re.sub(r"\s+", " ", str(x)).strip() for x in first_row]
+                split_df = split_df.iloc[1:].reset_index(drop=True)
+            df = split_df
+
+    if df is None:
         return None
 
-# -------- Processeur de texte --------
-class AdvancedTextProcessor:
-    """Processeur de texte spécialisé pour les noms techniques"""
-    
-    TECHNICAL_STOPWORDS = {
-        'de', 'à', 'et', 'en', 'pour', 'avec', 'sans', 'sur', 'dans',
-        'par', 'au', 'aux', 'le', 'la', 'les', 'un', 'une', 'des',
-        'du', 'd\'', 'l\'', 'est', 'son', 'sa', 'ses'
-    }
-    
-    @staticmethod
-    def normalize_technical_text(text: str) -> str:
-        """Normalisation pour textes techniques"""
-        if pd.isna(text) or not text:
-            return ""
-        
-        text = str(text)
-        text = text.lower()
+    df.columns = normalize_colnames(df.columns)
+    # garder Item Code en texte
+    for c in df.columns:
+        if "item" in c.lower() and "code" in c.lower():
+            df[c] = df[c].astype(str).str.strip()
+    return df
+
+def read_excel_with_sheet_selector(uploaded_file, key_prefix: str):
+    """Propose la sélection de feuille dans la sidebar et retourne le DF de la feuille choisie."""
+    if uploaded_file is None:
+        return None
+    raw = uploaded_file.getvalue()
+    xls = pd.ExcelFile(io.BytesIO(raw), engine="openpyxl")
+    sheet_names = xls.sheet_names
+    st.sidebar.caption(f"📑 Feuilles détectées ({key_prefix})")
+    sheet = st.sidebar.selectbox(
+        f"Sélectionne la feuille pour {key_prefix}",
+        options=sheet_names,
+        index=0,
+        key=f"{key_prefix}_sheet_select"
+    )
+    df = pd.read_excel(io.BytesIO(raw), sheet_name=sheet, engine="openpyxl")
+    df.columns = normalize_colnames(df.columns)
+    for c in df.columns:
+        if "item" in c.lower() and "code" in c.lower():
+            df[c] = df[c].astype(str).str.strip()
+    return df
+
+def load_any_table(uploaded_file, key_prefix: str):
+    """Charge CSV ou Excel + sélection de feuille pour Excel, normalisation CSV."""
+    if uploaded_file is None:
+        return None
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return read_csv_safely(uploaded_file)
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        return read_excel_with_sheet_selector(uploaded_file, key_prefix=key_prefix)
+    else:
+        try:
+            return read_csv_safely(uploaded_file)
+        except Exception:
+            return None
+
+def guess_column(cols, candidates):
+    """Devine une colonne via mots-clés ou regex."""
+    cols_norm = [c.lower() for c in cols]
+    for cand in candidates:
+        cand_low = cand.lower()
+        for c in cols_norm:
+            if cand_low in c:
+                return cols[cols_norm.index(c)]
+    for cand in candidates:
+        if cand.startswith("^") or cand.endswith("$"):
+            pat = re.compile(cand, re.I)
+            for i, c in enumerate(cols):
+                if re.search(pat, c):
+                    return cols[i]
+    return None
+
+def coerce_numeric(series):
+    """Convertit vers numérique en tolérant %, espaces, virgules FR."""
+    s = series.astype(str).str.replace("%", "", regex=False)
+    s = s.str.replace("\u202f", "", regex=False)  # espace fine
+    s = s.str.replace(" ", "", regex=False)
+    s = s.str.replace(",", ".", regex=False)      # décimales FR
+    return pd.to_numeric(s, errors="coerce")
+
+def strip_accents(text: str) -> str:
+    """Supprime les accents pour une comparaison robuste."""
+    try:
         text = unicodedata.normalize('NFKD', text)
-        text = ''.join(c for c in text if not unicodedata.combining(c))
-        text = re.sub(r'[^\w\s\-\.\/]', ' ', text)
-        text = re.sub(r'[_\-\/\\]+', ' ', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        
+        text = text.encode('ASCII', 'ignore').decode('utf-8')
         return text
-    
-    @staticmethod
-    def extract_technical_keywords(text: str) -> List[str]:
-        """Extrait les mots-clés techniques significatifs"""
-        normalized = AdvancedTextProcessor.normalize_technical_text(text)
-        words = normalized.split()
-        
-        keywords = []
-        for word in words:
-            if word in AdvancedTextProcessor.TECHNICAL_STOPWORDS:
-                continue
-            
-            if len(word) < 2 and not word.isdigit():
-                continue
-            
-            if word.isupper() and len(word) <= 5:
-                keywords.append(word)
-                continue
-            
-            if len(word) >= 3:
-                keywords.append(word)
-        
-        return keywords
+    except Exception:
+        return text
 
-# -------- Similarité technique --------
-class TechnicalSimilarity:
-    """Calcul de similarité pour textes techniques"""
-    
-    @staticmethod
-    def jaccard_similarity(set1: Set, set2: Set) -> float:
-        """Similarité de Jaccard"""
-        if not set1 or not set2:
-            return 0.0
-        
-        intersection = set1.intersection(set2)
-        union = set1.union(set2)
-        
-        if not union:
-            return 0.0
-        
-        return len(intersection) / len(union)
-    
-    @staticmethod
-    def technical_text_similarity(text1: str, text2: str) -> Dict[str, float]:
-        """Calcule la similarité entre deux textes techniques"""
-        
-        keywords1 = set(AdvancedTextProcessor.extract_technical_keywords(text1))
-        keywords2 = set(AdvancedTextProcessor.extract_technical_keywords(text2))
-        
-        jaccard_sim = TechnicalSimilarity.jaccard_similarity(keywords1, keywords2)
-        
-        domain1 = DomainKnowledgeBase.get_domain_group(text1)
-        domain2 = DomainKnowledgeBase.get_domain_group(text2)
-        
-        domain_sim = 0.3 if domain1 and domain2 and domain1 == domain2 else 0.0
-        
-        composite_score = (
-            jaccard_sim * 0.8 +
-            domain_sim * 0.2
-        )
-        
-        return {
-            'jaccard': jaccard_sim,
-            'domain': domain_sim,
-            'composite': composite_score,
-            'domain1': domain1,
-            'domain2': domain2
-        }
+def clean_text(t: str) -> str:
+    """Nettoie/normalise texte pour matching."""
+    if t is None:
+        return ""
+    t = str(t).lower()
+    t = strip_accents(t)
+    t = re.sub(r"[^\w\s\-]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
-# -------- Item Technique --------
-class TechnicalItem:
-    """Représente un item technique avec toutes ses propriétés"""
-    
-    def __init__(self, **kwargs):
-        # S'assurer que tous les attributs sont des strings
-        for key in kwargs:
-            if kwargs[key] is None or pd.isna(kwargs[key]):
-                kwargs[key] = ''
-            else:
-                kwargs[key] = str(kwargs[key])
-        
-        # Attributs de base
-        self.id = kwargs.get('id', '')
-        self.reference = kwargs.get('reference', '')
-        self.name = kwargs.get('name', '')
-        self.french_name = kwargs.get('french_name', '')
-        self.status = kwargs.get('status', '')
-        self.uom_name = kwargs.get('uom_name', '')
-        self.type_name = kwargs.get('type_name', '')
-        self.sub_category_name = kwargs.get('sub_category_name', '')
-        self.category_name = kwargs.get('category_name', '')
-        self.last_use = kwargs.get('last_use', '')
-        self.last_price = kwargs.get('last_price', '')
-        self.requestor_name = kwargs.get('requestor_name', '')
-        self.company_name = kwargs.get('company_name', '')
-        self.department_name = kwargs.get('department_name', '')
-        self.created_at = kwargs.get('created_at', '')
-        self.updated_at = kwargs.get('updated_at', '')
-        
-        # Attributs calculés
-        self._calculate_derived_fields()
-    
-    def _calculate_derived_fields(self):
-        """Calcule les champs dérivés"""
-        # Texte principal pour comparaison
-        self.main_text = f"{self.name} {self.french_name}".strip()
-        
-        # Normalisation
-        self.normalized_text = AdvancedTextProcessor.normalize_technical_text(self.main_text)
-        
-        # Mots-clés techniques
-        self.technical_keywords = AdvancedTextProcessor.extract_technical_keywords(self.main_text)
-        
-        # Domaine détecté
-        self.domain = DomainKnowledgeBase.get_domain_group(self.main_text)
-    
-    def get_similarity_fingerprint(self) -> str:
-        """Crée une empreinte pour comparaison rapide"""
-        # S'assurer que tous les éléments sont des strings
-        domain_str = str(self.domain) if self.domain else 'unknown'
-        keywords_str = '|'.join(sorted([str(k) for k in self.technical_keywords[:5]]))
-        type_str = str(self.type_name) if self.type_name else ''
-        category_str = str(self.category_name) if self.category_name else ''
-        
-        components = [domain_str, keywords_str, type_str, category_str]
-        
-        # Filtrer les chaînes vides et joindre
-        filtered = [c for c in components if c and str(c).strip()]
-        return '#'.join(filtered) if filtered else 'empty'
-    
-    def to_dict(self) -> Dict:
-        """Convertit en dictionnaire pour affichage"""
-        return {
-            'id': self.id,
-            'reference': self.reference,
-            'name': self.name,
-            'french_name': self.french_name,
-            'type_name': self.type_name,
-            'category_name': self.category_name,
-            'company_name': self.company_name,
-            'domain': self.domain,
-            'keywords': ', '.join(self.technical_keywords[:5])
-        }
+def token_set(text: str):
+    return set(clean_text(text).split())
 
-# -------- Détecteur de Doublons Technique --------
-class TechnicalDuplicateDetector:
-    """Détecteur spécialisé pour items techniques"""
-    
-    def __init__(self, items: List[TechnicalItem]):
-        self.items = items
-        self._build_indexes()
-    
-    def _build_indexes(self):
-        """Construit les index pour recherche rapide"""
-        self.by_domain = {}
-        
-        for item in self.items:
-            # Index par domaine
-            if item.domain:
-                self.by_domain.setdefault(item.domain, []).append(item)
-    
-    def find_technical_duplicates(self, target_item: TechnicalItem, 
-                                threshold: float = 0.6) -> List[Tuple[TechnicalItem, Dict]]:
-        """Trouve les doublons techniques"""
-        results = []
-        
-        # 1. Recherche par empreinte exacte
-        target_fingerprint = target_item.get_similarity_fingerprint()
-        for item in self.items:
-            if item.id == target_item.id:
-                continue
-            
-            item_fingerprint = item.get_similarity_fingerprint()
-            if item_fingerprint == target_fingerprint and item_fingerprint != 'empty':
-                similarity = {
-                    'composite': 1.0,
-                    'method': 'fingerprint_exact',
-                    'domain_match': True if item.domain == target_item.domain else False
-                }
-                results.append((item, similarity))
-        
-        if len(results) >= 10:
-            return results[:10]
-        
-        # 2. Collecte des candidats potentiels
-        candidates = []
-        
-        # Par domaine
-        if target_item.domain in self.by_domain:
-            candidates.extend(self.by_domain[target_item.domain])
-        
-        # Déduplication
-        candidates = list({item.id: item for item in candidates if item.id != target_item.id}.values())
-        
-        # 3. Calcul de similarité détaillé
-        for candidate in candidates[:50]:
-            similarity = TechnicalSimilarity.technical_text_similarity(
-                target_item.main_text,
-                candidate.main_text
+from difflib import SequenceMatcher
+def similarity(a: str, b: str):
+    """Similarité combinée: difflib + Jaccard (0.6/0.4)."""
+    a_clean, b_clean = clean_text(a), clean_text(b)
+    if not a_clean and not b_clean:
+        return 0.0
+    seq = SequenceMatcher(None, a_clean, b_clean).ratio()
+    ta, tb = token_set(a_clean), token_set(b_clean)
+    inter = len(ta & tb)
+    union = len(ta | tb) if (ta or tb) else 1
+    jacc = inter / union
+    return 0.6 * seq + 0.4 * jacc
+
+def find_best_match(query_text: str, candidates: pd.Series, top_n=3):
+    scores = candidates.fillna("").astype(str).apply(lambda x: similarity(query_text, x))
+    top_idx = scores.sort_values(ascending=False).head(top_n).index
+    return pd.DataFrame({
+        "po_index": top_idx,
+        "po_description": candidates.loc[top_idx].values,
+        "score": scores.loc[top_idx].values
+    })
+
+def to_excel_bytes(df_dict: dict):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet, df in df_dict.items():
+            pd.DataFrame(df).to_excel(writer, index=False, sheet_name=sheet[:31])
+    return output.getvalue()
+
+# =========================
+# Sidebar: chargement
+# =========================
+st.sidebar.title("⚙️ Paramètres")
+
+st.sidebar.header("1) Charger les fichiers")
+po_file    = st.sidebar.file_uploader("Fichier POs (CSV/XLSX)",   type=["csv", "xlsx", "xls"], key="po_file")
+stock_file = st.sidebar.file_uploader("Fichier Stock (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="stock_file")
+
+po_df    = load_any_table(po_file,    key_prefix="PO")
+stock_df = load_any_table(stock_file, key_prefix="STOCK")
+
+# =========================
+# Titre
+# =========================
+st.title("📦 Comparaison Stock (Total livré) vs Quantité Commandée (PO)")
+
+# Aperçus
+col1, col2 = st.columns(2)
+with col1:
+    if po_df is not None:
+        st.subheader("Aperçu POs")
+        st.dataframe(po_df.head(25), use_container_width=True)
+with col2:
+    if stock_df is not None:
+        st.subheader("Aperçu Stock")
+        st.dataframe(stock_df.head(25), use_container_width=True)
+
+if (po_df is None) or (stock_df is None):
+    st.info("➡️ Merci d’uploader **les deux fichiers**. Cette version normalise les CSV et permet la sélection de feuille Excel.")
+    st.stop()
+
+# =========================
+# Mapping des colonnes
+# =========================
+st.sidebar.header("2) Mapper les colonnes")
+
+# POs
+st.sidebar.caption("🟦 Colonnes POs")
+po_item_col = st.sidebar.selectbox(
+    "Colonne Item Code (PO)",
+    options=po_df.columns,
+    index=(po_df.columns.tolist().index(guess_column(po_df.columns, ["item code", "item", "code"]))
+           if guess_column(po_df.columns, ["item code", "item", "code"]) in po_df.columns else 0)
+)
+po_qty_col = st.sidebar.selectbox(
+    "Colonne Quantité (PO)",
+    options=po_df.columns,
+    index=(po_df.columns.tolist().index(guess_column(po_df.columns, ["qty", "quantity", "^qte$", "qte"]))
+           if guess_column(po_df.columns, ["qty", "quantity", "^qte$", "qte"]) in po_df.columns else 0)
+)
+po_date_col = st.sidebar.selectbox(
+    "Colonne Date PO (facultatif)",
+    options=["(aucune)"] + po_df.columns.tolist(),
+    index=(po_df.columns.tolist().index(guess_column(po_df.columns, ["created_at", "po date", "date"])) + 1
+           if guess_column(po_df.columns, ["created_at", "po date", "date"]) in po_df.columns else 0)
+)
+po_desc_col = st.sidebar.selectbox(
+    "Colonne Description (POs - pour matching)",
+    options=["(aucune)"] + po_df.columns.tolist(),
+    index=(po_df.columns.tolist().index(guess_column(po_df.columns, ["description", "desc"])) + 1
+           if guess_column(po_df.columns, ["description", "desc"]) in po_df.columns else 0)
+)
+
+# Stock
+st.sidebar.caption("🟩 Colonnes Stock")
+stock_item_col = st.sidebar.selectbox(
+    "Colonne Item Code (Stock)",
+    options=stock_df.columns,
+    index=(stock_df.columns.tolist().index(guess_column(stock_df.columns, ["item code", "item", "code"]))
+           if guess_column(stock_df.columns, ["item code", "item", "code"]) in stock_df.columns else 0)
+)
+stock_qty_col = st.sidebar.selectbox(
+    "Colonne Quantité Stock (Total livré / Stock Qty)",
+    options=stock_df.columns,
+    index=(stock_df.columns.tolist().index(guess_column(stock_df.columns, ["total livré", "stock qty", "total stock", "qty", "quantity"]))
+           if guess_column(stock_df.columns, ["total livré", "stock qty", "total stock", "qty", "quantity"]) in stock_df.columns else 0)
+)
+stock_sapname_col = st.sidebar.selectbox(
+    "Colonne SAP Name (Stock - pour matching)",
+    options=["(aucune)"] + stock_df.columns.tolist(),
+    index=(stock_df.columns.tolist().index(guess_column(stock_df.columns, ["sap name", "sap", "designation", "item name"])) + 1
+           if guess_column(stock_df.columns, ["sap name", "sap", "designation", "item name"]) in stock_df.columns else 0)
+)
+
+# =========================
+# Préparation & filtres
+# =========================
+po_df["_item"] = po_df[po_item_col].astype(str).str.strip()
+stock_df["_item"] = stock_df[stock_item_col].astype(str).str.strip()
+
+po_df["_qty"] = coerce_numeric(po_df[po_qty_col])
+stock_df["_stock_qty"] = coerce_numeric(stock_df[stock_qty_col])
+
+if po_date_col and po_date_col != "(aucune)":
+    po_df["_date"] = pd.to_datetime(po_df[po_date_col], errors="coerce", dayfirst=True)
+else:
+    po_df["_date"] = pd.NaT
+
+st.sidebar.header("3) Filtres")
+alert_threshold = st.sidebar.slider("Seuil Alerte % écarts négatifs", 0, 100, 20, help="Au-delà, alerte rouge globale")
+if po_df["_date"].notna().any():
+    dmin = pd.to_datetime(po_df["_date"].min())
+    dmax = pd.to_datetime(po_df["_date"].max())
+    date_range = st.sidebar.date_input("Filtrer par date PO", (dmin.date(), dmax.date()))
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+        po_df = po_df[(po_df["_date"] >= start) & (po_df["_date"] <= end)]
+else:
+    st.sidebar.caption("Aucune date valide détectée dans les POs.")
+
+item_filter = st.sidebar.text_input("Filtrer par Item Code (contient…)", "")
+if item_filter.strip():
+    po_df = po_df[po_df["_item"].str.contains(item_filter.strip(), case=False, na=False)]
+
+# =========================
+# Agrégations principales
+# =========================
+agg_po = (po_df
+          .groupby("_item", dropna=False)
+          .agg(
+              total_commande=("_qty", "sum"),
+              nb_pos=("_qty", "count"),
+              derniere_date=("_date", "max"),
+              description=(po_desc_col, "last") if (po_desc_col and po_desc_col != "(aucune)") else ("_item", "first")
+          )
+          .reset_index()
+         )
+
+agg_stock = (stock_df
+             .groupby("_item", dropna=False)
+             .agg(
+                 stock_total=("_stock_qty", "sum"),
+                 sap_name=(stock_sapname_col, "last") if (stock_sapname_col and stock_sapname_col != "(aucune)") else ("_item", "first")
+             )
+             .reset_index()
             )
-            
-            similarity['final'] = similarity['composite']
-            
-            if similarity['final'] >= threshold:
-                results.append((candidate, similarity))
-        
-        # 4. Tri par score final
-        results.sort(key=lambda x: x[1]['final'], reverse=True)
-        return results[:10]
-    
-    def analyze_domains_distribution(self) -> Dict:
-        """Analyse la distribution par domaine"""
-        distribution = {}
-        for item in self.items:
-            domain = item.domain or 'non_classé'
-            distribution[domain] = distribution.get(domain, 0) + 1
-        
-        return dict(sorted(distribution.items(), key=lambda x: x[1], reverse=True))
 
-# -------- Interface Streamlit --------
-def main():
-    # CSS personnalisé
+res = agg_po.merge(agg_stock, on="_item", how="outer")
+res["total_commande"] = res["total_commande"].fillna(0)
+res["stock_total"] = res["stock_total"].fillna(0)
+
+res["ecart_stock_moins_commande"] = res["stock_total"] - res["total_commande"]
+res["taux_couverture"] = np.where(res["total_commande"] > 0,
+                                  res["stock_total"] / res["total_commande"],
+                                  np.nan)
+
+final_cols = {
+    "_item": "Item Code",
+    "description": "Description (PO)",
+    "sap_name": "SAP Name (Stock)",
+    "nb_pos": "Nb POs",
+    "derniere_date": "Dernière date PO",
+    "total_commande": "Total commandé",
+    "stock_total": "Stock (Total livré)",
+    "ecart_stock_moins_commande": "Écart = Stock - Commandé",
+    "taux_couverture": "Taux de couverture"
+}
+res = res.rename(columns=final_cols)
+res = res[list(final_cols.values())]
+
+# =========================
+# KPIs + ALERTES ROUGES
+# =========================
+all_items_mask = (res["Total commandé"].fillna(0) + res["Stock (Total livré)"].fillna(0)) > 0
+nb_total_items = int(all_items_mask.sum())
+nb_neg = int((res["Écart = Stock - Commandé"] < 0).sum())
+nb_pos = int((res["Écart = Stock - Commandé"] > 0).sum())
+pct_neg = (nb_neg / nb_total_items * 100) if nb_total_items else 0
+pct_pos = (nb_pos / nb_total_items * 100) if nb_total_items else 0
+
+colA, colB, colC, colD = st.columns(4)
+with colA:
+    st.metric("Total commandé (tous items)", f"{res['Total commandé'].sum():,.0f}")
+with colB:
+    st.metric("Stock total (tous items)", f"{res['Stock (Total livré)'].sum():,.0f}")
+with colC:
+    st.metric("Écart global (Stock - Commandé)",
+              f"{(res['Stock (Total livré)'].sum() - res['Total commandé'].sum()):,.0f}")
+with colD:
+    st.metric("Écarts (+ / -)", f"{pct_pos:.1f}% / {pct_neg:.1f}%")
+
+def show_alerts():
+    messages = []
+    if pct_neg >= alert_threshold:
+        messages.append(f"⚠️ {pct_neg:.1f}% des items ont un **écart négatif** (stock < commandé).")
+    # Orphelins
+    _orph = res[(res["Stock (Total livré)"] > 0) & (res["Total commandé"] == 0)]
+    if len(_orph) > 0:
+        messages.append(f"📦 **{len(_orph)} item(s) en stock sans PO** (orphelins).")
+    # Items inexistants (ni stock ni PO)
+    _void = res[(res["Stock (Total livré)"] == 0) & (res["Total commandé"] == 0)]
+    if len(_void) > 0:
+        messages.append(f"ℹ️ {len(_void)} référence(s) sans activité (ni stock ni commande) dans la plage filtrée.")
+    if messages:
+        st.error(" / ".join(messages))
+    else:
+        st.success("Tout est OK ✅ : aucun signal critique sur la période.")
+
+show_alerts()
+
+# =========================
+# Détails (table principale)
+# =========================
+st.markdown("### 🧾 Détails par Item")
+def color_ecart(val):
+    try:
+        v = float(val)
+        if v < 0:  # négatif -> rouge
+            return "background-color:#ffefef;color:#b00020;font-weight:700;"
+        elif v > 0:  # positif -> vert clair
+            return "background-color:#eaffea;color:#0b6b2a;font-weight:700;"
+    except:
+        pass
+    return ""
+styled = (res
+          .style
+          .format({
+              "Total commandé": "{:,.0f}",
+              "Stock (Total livré)": "{:,.0f}",
+              "Écart = Stock - Commandé": "{:,.0f}",
+              "Taux de couverture": "{:.2%}"
+          })
+          .applymap(color_ecart, subset=["Écart = Stock - Commandé"])
+         )
+st.dataframe(styled, use_container_width=True, hide_index=True)
+
+# =========================
+# Analyse avancée : Orphelins & matching
+# =========================
+st.markdown("## 🔍 Analyse avancée : Items en Stock sans PO & correspondances par similarité")
+
+st.sidebar.header("4) Paramètres de matching")
+similarity_threshold = st.sidebar.slider("Seuil de similarité (0–1)", 0.0, 1.0, 0.65, 0.05)
+top_n_matches = st.sidebar.slider("Top-N correspondances par item", 1, 5, 3)
+
+# Orphans = items avec stock>0 ET total_commande==0
+orphans = res[(res["Stock (Total livré)"] > 0) & (res["Total commandé"] == 0)].copy()
+st.write(f"**Items orphelins détectés (stock > 0, aucune commande)** : {len(orphans)}")
+
+# Séries POs pour matching
+if po_desc_col and po_desc_col != "(aucune)" and po_desc_col in po_df.columns:
+    po_desc_clean = po_df[po_desc_col].fillna("").astype(str)
+else:
+    po_desc_clean = pd.Series(dtype=str)
+
+po_item_series = po_df["_item"].fillna("").astype(str)
+po_qty_series  = po_df["_qty"].reset_index(drop=True)
+
+matches_rows = []
+if not orphans.empty and not po_desc_clean.empty and (stock_sapname_col and stock_sapname_col != "(aucune)"):
+    po_desc_indexed = po_desc_clean.reset_index(drop=False)
+    po_desc_indexed.columns = ["po_row_index", "po_description"]
+    po_desc_indexed["po_item_code"] = po_item_series.reset_index(drop=True)
+
+    for _, r in orphans.iterrows():
+        stock_item   = r["Item Code"]
+        stock_name   = r["SAP Name (Stock)"]
+        stock_qty    = r["Stock (Total livré)"]
+
+        top_df = find_best_match(stock_name, po_desc_indexed["po_description"], top_n=top_n_matches)
+
+        top_df["po_item_code"] = top_df["po_index"].apply(
+            lambda i: po_desc_indexed.loc[i, "po_item_code"] if i in po_desc_indexed.index else np.nan
+        )
+        top_df["po_qty_line"] = top_df["po_index"].apply(
+            lambda i: po_qty_series.iloc[i] if i < len(po_qty_series) else np.nan
+        )
+
+        top_df["stock_item_code"] = stock_item
+        top_df["stock_sap_name"]  = stock_name
+        top_df["stock_qty"]       = stock_qty
+
+        top_df = top_df[top_df["score"] >= similarity_threshold]
+        if not top_df.empty:
+            matches_rows.append(top_df)
+
+if matches_rows:
+    matches_df = pd.concat(matches_rows, ignore_index=True)
+    matches_df["po_qty_line"] = pd.to_numeric(matches_df["po_qty_line"], errors="coerce")
+    agg_matches = (matches_df
+                   .groupby(["stock_item_code", "stock_sap_name", "po_description", "po_item_code"], dropna=False)
+                   .agg(
+                       similarity=("score", "max"),
+                       stock_qty=("stock_qty", "first"),
+                       total_po_qty_assoc=("po_qty_line", "sum")
+                   ).reset_index())
+else:
+    agg_matches = pd.DataFrame(columns=["stock_item_code", "stock_sap_name", "po_description", "po_item_code", "similarity", "stock_qty", "total_po_qty_assoc"])
+
+st.markdown("### 🧩 Correspondances proposées (SAP Name ~ Description PO)")
+if agg_matches.empty:
+    st.info("Aucune correspondance proposée selon le seuil actuel. Essaie d’abaisser le seuil de similarité.")
+else:
+    st.dataframe(
+        agg_matches.sort_values(["similarity", "stock_qty"], ascending=[False, False]),
+        use_container_width=True
+    )
+
+# ---- Tableau demandé : les orphelins + meilleur match (desc + item code PO) ----
+if not agg_matches.empty:
+    best_matches = (agg_matches.sort_values(["stock_item_code", "similarity"], ascending=[True, False])
+                    .groupby("stock_item_code", as_index=False)
+                    .first())
+    orphans_summary = (orphans[["Item Code", "SAP Name (Stock)", "Stock (Total livré)"]]
+                       .merge(best_matches.rename(columns={
+                           "stock_item_code": "Item Code",
+                           "stock_sap_name": "SAP Name (Stock)",
+                           "po_description": "PO description correspondante",
+                           "po_item_code": "PO Item Code",
+                           "similarity": "Similarité",
+                           "total_po_qty_assoc": "Total Qty PO (assoc.)"
+                       }),
+                              on=["Item Code", "SAP Name (Stock)"],
+                              how="left"))
+    orphans_summary["Match trouvé ?"] = np.where(orphans_summary["PO description correspondante"].notna(), "Oui", "Non")
+else:
+    orphans_summary = orphans[["Item Code", "SAP Name (Stock)", "Stock (Total livré)"]].copy()
+    orphans_summary["PO description correspondante"] = np.nan
+    orphans_summary["PO Item Code"] = np.nan
+    orphans_summary["Similarité"] = np.nan
+    orphans_summary["Total Qty PO (assoc.)"] = np.nan
+    orphans_summary["Match trouvé ?"] = "Non"
+
+st.markdown("### 📋 Orphelins — meilleur match (description & Item Code PO)")
+st.dataframe(
+    orphans_summary.sort_values(["Match trouvé ?", "Similarité"], ascending=[True, False]),
+    use_container_width=True
+)
+
+# =========================
+# DÉTAILS & Journal anomalies
+# =========================
+with st.expander("ℹ️ Détails & contrôles qualité (clique pour ouvrir)"):
     st.markdown("""
-    <style>
-        .main-title {
-            text-align: center;
-            font-size: 2.5rem;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 1rem;
-        }
-        
-        .domain-badge {
-            display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 12px;
-            font-size: 0.8rem;
-            font-weight: 600;
-            margin: 0.1rem;
-        }
-        
-        .fibre-badge { background: #8B5CF6; color: white; }
-        .generateur-badge { background: #10B981; color: white; }
-        .cable-badge { background: #F59E0B; color: white; }
-        .connecteur-badge { background: #EF4444; color: white; }
-        .outil-badge { background: #3B82F6; color: white; }
-        .securite-badge { background: #EC4899; color: white; }
-        .reseau-badge { background: #6366F1; color: white; }
-        .other-badge { background: #6B7280; color: white; }
-        
-        .duplicate-card {
-            border-left: 4px solid #8B5CF6;
-            padding: 1rem;
-            margin: 0.5rem 0;
-            background: #F8FAFC;
-            border-radius: 8px;
-        }
-        
-        .similarity-bar {
-            height: 8px;
-            background: #E5E7EB;
-            border-radius: 4px;
-            margin: 0.5rem 0;
-            overflow: hidden;
-        }
-        
-        .similarity-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #10B981, #3B82F6);
-            border-radius: 4px;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # Header
-    st.markdown('<h1 class="main-title">🔍 Détection Intelligente de Doublons Techniques</h1>', unsafe_allow_html=True)
-    st.caption("Optimisé pour vos items techniques")
-    
-    # Sidebar
-    with st.sidebar:
-        st.markdown("### 📤 Chargement des données")
-        
-        uploaded_file = st.file_uploader(
-            "Téléversez votre fichier CSV",
-            type=['csv'],
-            help="Peut contenir des colonnes génériques (Colonne1, Colonne2...)"
-        )
-        
-        if uploaded_file:
-            try:
-                # Essayer différents séparateurs
-                try:
-                    df = pd.read_csv(uploaded_file, sep=';', dtype=str, encoding='utf-8', on_bad_lines='skip')
-                except:
-                    df = pd.read_csv(uploaded_file, sep=',', dtype=str, encoding='utf-8', on_bad_lines='skip')
-                
-                # Stocker le dataframe brut
-                st.session_state.raw_df = df
-                st.session_state.filename = uploaded_file.name
-                
-                st.success(f"✅ Fichier chargé : {uploaded_file.name}")
-                st.metric("Lignes", len(df))
-                st.metric("Colonnes", len(df.columns))
-                
-                # Afficher un aperçu
-                with st.expander("📋 Aperçu des données"):
-                    st.dataframe(df.head(), use_container_width=True)
-                
-                # Vérifier si les colonnes attendues sont présentes
-                if 'name' in df.columns and 'reference' in df.columns:
-                    st.session_state.column_mapping = {col: col for col in EXPECTED_COLUMNS if col in df.columns}
-                    st.info("✅ Colonnes détectées automatiquement")
-                else:
-                    st.info("🔧 Mapping des colonnes nécessaire")
-                    if st.button("🗺️ Configurer le mapping"):
-                        st.session_state.need_mapping = True
-                
-            except Exception as e:
-                st.error(f"❌ Erreur de chargement : {str(e)}")
-                return
-    
-    # Contenu principal
-    if 'raw_df' not in st.session_state:
-        st.info("👈 Veuillez téléverser un fichier CSV dans la barre latérale")
-        return
-    
-    # Étape 1 : Mapping des colonnes si nécessaire
-    if hasattr(st.session_state, 'need_mapping') and st.session_state.need_mapping:
-        st.header("🗺️ Mapping des colonnes")
-        
-        df = st.session_state.raw_df
-        
-        # Détection automatique
-        auto_mapping = detect_columns_automatically(df)
-        
-        st.markdown("### Détection automatique")
-        if auto_mapping:
-            st.success(f"✅ {len(auto_mapping)} colonnes détectées automatiquement")
-        
-        # Mapping interactif
-        st.markdown("### 📝 Mapping manuel")
-        
-        column_mapping = {}
-        critical_fields = ['name', 'reference']
-        
-        for field in critical_fields:
-            st.markdown(f"**{field.upper()}**")
-            
-            # Suggestions
-            suggestions = []
-            if field in auto_mapping:
-                suggestions.append(auto_mapping[field])
-            
-            for col in df.columns:
-                if col not in suggestions:
-                    suggestions.append(col)
-            
-            selected_col = st.selectbox(
-                f"Colonne pour '{field}' :",
-                options=suggestions,
-                key=f"map_{field}"
-            )
-            
-            if selected_col:
-                column_mapping[field] = selected_col
-        
-        # Validation
-        if st.button("✅ Valider le mapping", type="primary"):
-            if 'name' in column_mapping and 'reference' in column_mapping:
-                st.session_state.column_mapping = column_mapping
-                st.session_state.need_mapping = False
-                st.success("Mapping validé !")
-                st.rerun()
-            else:
-                st.error("Veuillez mapper au moins les champs 'name' et 'reference'")
-    
-    # Étape 2 : Traitement des données
-    elif 'column_mapping' in st.session_state:
-        df = st.session_state.raw_df
-        
-        # Appliquer le mapping
-        processed_df = pd.DataFrame()
-        
-        for field, source_col in st.session_state.column_mapping.items():
-            if source_col in df.columns:
-                processed_df[field] = df[source_col].astype(str)
-            else:
-                processed_df[field] = ''
-        
-        # Remplir les colonnes manquantes
-        for col in EXPECTED_COLUMNS:
-            if col not in processed_df.columns:
-                processed_df[col] = ''
-        
-        # Conversion en TechnicalItem
-        if 'technical_items' not in st.session_state:
-            with st.spinner("Traitement des données..."):
-                technical_items = []
-                
-                for idx, row in processed_df.iterrows():
-                    item_data = {col: row.get(col, '') for col in EXPECTED_COLUMNS}
-                    technical_item = TechnicalItem(**item_data)
-                    technical_items.append(technical_item)
-                
-                # Création du détecteur
-                detector = TechnicalDuplicateDetector(technical_items)
-                
-                # Stockage en session
-                st.session_state.df = processed_df
-                st.session_state.detector = detector
-                st.session_state.technical_items = technical_items
-        
-        # Affichage principal
-        st.header("🔍 Recherche de doublons techniques")
-        
-        # Mode de recherche
-        search_mode = st.radio(
-            "Mode de recherche :",
-            ["Sélectionner un item existant", "Saisir un nouvel item"],
-            horizontal=True,
-            key="search_mode"
-        )
-        
-        if search_mode == "Sélectionner un item existant":
-            # Liste des items disponibles
-            item_options = [f"{item.name[:50]}... | {item.reference}" 
-                          if len(item.name) > 50 else f"{item.name} | {item.reference}"
-                          for item in st.session_state.technical_items[:100]]
-            
-            if not item_options:
-                st.warning("Aucun item trouvé dans les données")
-                return
-                
-            selected_item_str = st.selectbox(
-                "Sélectionnez un item à analyser :",
-                options=item_options,
-                index=0
-            )
-            
-            # Extraire le nom de l'item sélectionné
-            selected_name = selected_item_str.split(' | ')[0]
-            target_item = None
-            
-            for item in st.session_state.technical_items:
-                if item.name.startswith(selected_name.replace('...', '')):
-                    target_item = item
-                    break
-        
-        else:
-            # Saisie manuelle
-            st.markdown("### 📝 Saisie d'un nouvel item")
-            
-            col_name, col_ref = st.columns(2)
-            with col_name:
-                item_name = st.text_input("Nom de l'item *", "", 
-                                        placeholder="Ex: Câble fibre optique 50m")
-            with col_ref:
-                item_reference = st.text_input("Référence", "", 
-                                             placeholder="Ex: FIB-50M")
-            
-            if st.button("Analyser cet item", key="analyze_manual"):
-                if item_name:
-                    target_item = TechnicalItem(
-                        name=item_name,
-                        reference=item_reference
-                    )
-                else:
-                    st.warning("Veuillez saisir au moins le nom de l'item")
-                    target_item = None
-            else:
-                target_item = None
-        
-        # Affichage et analyse de l'item cible
-        if target_item:
-            st.markdown("### 📋 Analyse de l'item")
-            
-            col_info1, col_info2 = st.columns(2)
-            with col_info1:
-                st.metric("Nom", target_item.name[:50] + "..." if len(target_item.name) > 50 else target_item.name)
-            with col_info2:
-                badge_class = {
-                    'fibre_optique': 'fibre-badge',
-                    'generateurs': 'generateur-badge',
-                    'cables': 'cable-badge',
-                    'connecteurs': 'connecteur-badge',
-                    'outillage': 'outil-badge',
-                    'securite': 'securite-badge',
-                    'reseau': 'reseau-badge'
-                }.get(target_item.domain, 'other-badge')
-                
-                domain_display = target_item.domain or "Non classé"
-                st.markdown(f'<span class="domain-badge {badge_class}">{domain_display}</span>', 
-                          unsafe_allow_html=True)
-            
-            # Recherche de doublons
-            st.markdown("---")
-            st.markdown("### 🎯 Recherche de doublons techniques")
-            
-            similarity_threshold = st.slider(
-                "Seuil de similarité",
-                min_value=0.3,
-                max_value=0.9,
-                value=0.6,
-                step=0.05
-            )
-            
-            max_results = st.slider(
-                "Nombre max de résultats",
-                min_value=5,
-                max_value=20,
-                value=10,
-                step=1
-            )
-            
-            if st.button("🔍 Lancer la recherche", type="primary"):
-                with st.spinner("Recherche de doublons en cours..."):
-                    duplicates = st.session_state.detector.find_technical_duplicates(
-                        target_item, 
-                        threshold=similarity_threshold
-                    )
-                    
-                    if not duplicates:
-                        st.success("✅ Aucun doublon technique détecté !")
-                    else:
-                        st.warning(f"⚠️ {len(duplicates)} doublon(s) potentiel(s) détecté(s)")
-                        
-                        # Affichage des résultats
-                        for idx, (item, similarity) in enumerate(duplicates[:max_results]):
-                            with st.container():
-                                st.markdown(f"""
-                                <div class="duplicate-card">
-                                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                                        <div>
-                                            <strong>{item.name[:100]}{'...' if len(item.name) > 100 else ''}</strong><br>
-                                            <small>
-                                                Réf: {item.reference} | 
-                                                Cat: {item.category_name}
-                                            </small>
-                                        </div>
-                                        <div style="text-align: right;">
-                                            <span style="font-size: 1.2rem; font-weight: bold; color: #8B5CF6;">
-                                                {similarity['final']:.1%}
-                                            </span><br>
-                                            <small style="color: #6B7280;">score</small>
-                                        </div>
-                                    </div>
-                                    
-                                    <div class="similarity-bar">
-                                        <div class="similarity-fill" style="width: {similarity['final'] * 100}%"></div>
-                                    </div>
-                                </div>
-                                """, unsafe_allow_html=True)
-                                
-                                # Option pour voir plus de détails
-                                with st.expander("📊 Détails de la similarité"):
-                                    st.write(f"**Similarité Jaccard:** {similarity['jaccard']:.1%}")
-                                    st.write(f"**Domaine 1:** {similarity.get('domain1', 'N/A')}")
-                                    st.write(f"**Domaine 2:** {similarity.get('domain2', 'N/A')}")
-                                    st.write(f"**Score composite:** {similarity['composite']:.1%}")
+    **Contrôles effectués par l'application :**
+    - Normalisation POs (CSV à séparateur ; , \\t |) et protection **Item Code** en texte.
+    - Sélection de **feuille Excel** pour Stock/POs.
+    - Agrégation par **Item Code** : *Total commandé*, *Stock (Total livré)*.
+    - Calcul **Écart = Stock - Commandé** et **Taux de couverture**.
+    - Détection **Orphelins** (stock > 0, aucune commande).
+    - Matching par similarité **SAP Name** (Stock) ↔ **Description** (POs) + récupération **PO Item Code**.
+    - Export Excel multi-feuilles : Comparaison, Orphans, Correspondances détaillées, Orphelins + meilleur match, Synthèse KPI.
+    """)
 
-if __name__ == "__main__":
-    main()
+    st.markdown("**Journal d’anomalies :**")
+    anomalies = {
+        "Écarts négatifs (stock < commandé)": res[res["Écart = Stock - Commandé"] < 0][["Item Code","Description (PO)","SAP Name (Stock)","Total commandé","Stock (Total livré)","Écart = Stock - Commandé"]],
+        "Orphelins (stock > 0, aucune commande)": orphans[["Item Code","SAP Name (Stock)","Stock (Total livré)"]],
+        "Références sans activité (0 stock & 0 PO)": res[(res["Stock (Total livré)"] == 0) & (res["Total commandé"] == 0)][["Item Code","Description (PO)","SAP Name (Stock)"]],
+    }
+    for title, df_ in anomalies.items():
+        st.markdown(f"- <span class='badge badge-red'>{title} — {len(df_)}</span>", unsafe_allow_html=True)
+        if len(df_) > 0:
+            st.dataframe(df_, use_container_width=True)
+
+# =========================
+# Visualisation (Top écarts)
+# =========================
+st.markdown("### 🔎 Top 20 des écarts (absolus)")
+top = res.assign(abs_ecart=res["Écart = Stock - Commandé"].abs()).sort_values("abs_ecart", ascending=False).head(20)
+chart_data = top[["Item Code", "Écart = Stock - Commandé"]].set_index("Item Code")
+st.bar_chart(chart_data)
+
+# =========================
+# Export Excel multi-feuilles
+# =========================
+st.markdown("### 📥 Export")
+summary_df = pd.DataFrame({
+    "KPI": ["Total commandé", "Stock total", "Écart global", "% Écarts positifs", "% Écarts négatifs",
+            "Orphans (Stock sans PO)", "Orphans avec meilleur match"],
+    "Valeur": [
+        res["Total commandé"].sum(),
+        res["Stock (Total livré)"].sum(),
+        res["Stock (Total livré)"].sum() - res["Total commandé"].sum(),
+        pct_pos,
+        pct_neg,
+        len(orphans),
+        int(orphans_summary["Match trouvé ?"].eq("Oui").sum())
+    ]
+})
+
+excel_bytes = to_excel_bytes({
+    "Comparaison": res,
+    "Orphans": orphans,
+    "Correspondances_détaillées": agg_matches,
+    "Orphans_meilleur_match": orphans_summary,
+    "Synthese_KPI": summary_df
+})
+st.download_button(
+    label="Télécharger l’analyse (Excel)",
+    data=excel_bytes,
+    file_name=f"analyse_stock_vs_pos_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+st.caption("Astuce : ajuste le **seuil de similarité** et le **seuil d’alerte** pour ton contexte.")
