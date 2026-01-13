@@ -1,3 +1,4 @@
+
 # ================================================================
 # Items — Upload CSV → Détection de doublons → Saisie Multiple
 # Auteur : Zineb FAKKAR – Janv 2026
@@ -44,7 +45,7 @@ class Constants:
     CACHE_TTL = 3600
     MAX_ITEMS_BATCH = 50
 
-# -------- Données locales par défaut (MODIF NOUVELLE) --------
+# -------- Données locales par défaut (Chargement auto) --------
 DEFAULT_FILE_NAME = "export.csv"
 DEFAULT_FILE_PATH = Path(__file__).parent / DEFAULT_FILE_NAME  # IAAPP/ITEMAPP/export.csv
 
@@ -202,7 +203,7 @@ def clean_reference(ref: str) -> str:
     ref = re.sub(r'[\s\-_\./]', '', ref)
     return ref
 
-# -------- Lecture CSV --------
+# -------- Lecture CSV (CACHE DATA: retourne uniquement df) --------
 EXPECTED_COLS = [
     "id", "reference", "item_name", "french_name", "uom_name",
     "type_name", "sub_category_name", "category_name", "company_name",
@@ -233,9 +234,8 @@ def auto_detect_sep(sample_bytes: bytes) -> str:
     return ";" if head.count(";") >= head.count(",") else ","
 
 @st.cache_data(ttl=3600, show_spinner=True)
-def read_and_normalize_df(uploaded_file_bytes: bytes, filename: str) -> Tuple[pd.DataFrame, ItemCache]:
-    """Lit et normalise le DataFrame en une seule passe avec cache"""
-
+def read_and_normalize_df(uploaded_file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Lit et normalise le DataFrame en une seule passe avec cache (retourne uniquement df)"""
     sep = auto_detect_sep(uploaded_file_bytes)
 
     try:
@@ -259,7 +259,7 @@ def read_and_normalize_df(uploaded_file_bytes: bytes, filename: str) -> Tuple[pd
 
     # Renommer colonnes
     rename_dict = {k: v for k, v in RENAME_MAP.items()
-                  if k in df.columns and v not in df.columns}
+                   if k in df.columns and v not in df.columns}
     if rename_dict:
         df = df.rename(columns=rename_dict)
 
@@ -294,7 +294,12 @@ def read_and_normalize_df(uploaded_file_bytes: bytes, filename: str) -> Tuple[pd
         axis=1
     )
 
-    # Construire le cache
+    return df
+
+# -------- Construction du cache d'items (CACHE RESOURCE) --------
+@st.cache_resource(show_spinner=False)
+def build_item_cache(df: pd.DataFrame) -> ItemCache:
+    """Construit l'ItemCache à partir d'un df (resource cache pour objets non-pickle)"""
     items = []
     for _, row in df.iterrows():
         item = Item(
@@ -319,8 +324,21 @@ def read_and_normalize_df(uploaded_file_bytes: bytes, filename: str) -> Tuple[pd
 
     cache = ItemCache()
     cache.build(items)
+    return cache
 
-    return df, cache
+# -------- Chargement local (df uniquement) --------
+def load_local_csv_if_available() -> Optional[Tuple[pd.DataFrame, str]]:
+    """
+    Charge export.csv localement s'il existe. Retourne (df, filename) ou None si absent.
+    """
+    try:
+        if DEFAULT_FILE_PATH.exists() and DEFAULT_FILE_PATH.is_file():
+            file_bytes = DEFAULT_FILE_PATH.read_bytes()
+            df = read_and_normalize_df(file_bytes, DEFAULT_FILE_PATH.name)  # df seulement
+            return df, DEFAULT_FILE_PATH.name
+    except Exception as e:
+        st.warning(f"Impossible de lire le fichier local {DEFAULT_FILE_PATH}: {e}")
+    return None
 
 # -------- Similarité rapide --------
 class FastSimilarity:
@@ -353,7 +371,7 @@ class FastSimilarity:
 
 # -------- Détection de doublons --------
 def find_duplicates_fast(cache: ItemCache, new_item: Item,
-                        topn: int = 10, threshold: float = 0.82) -> List[Tuple[Item, float, str]]:
+                         topn: int = 10, threshold: float = 0.82) -> List[Tuple[Item, float, str]]:
     """Trouve les doublons potentiels rapidement"""
     results = []
     processed_ids = set()
@@ -362,8 +380,8 @@ def find_duplicates_fast(cache: ItemCache, new_item: Item,
     if new_item.reference:
         ref_clean = clean_reference(new_item.reference)
         exact_ref_matches = [item for item in cache.all_items
-                           if clean_reference(item.reference) == ref_clean
-                           and item.id != new_item.id]
+                             if clean_reference(item.reference) == ref_clean
+                             and item.id != new_item.id]
 
         for item in exact_ref_matches:
             if item.id not in processed_ids:
@@ -547,7 +565,7 @@ def detect_global_duplicates_optimized(df: pd.DataFrame, cache: ItemCache,
     all_pairs = []
     with ThreadPoolExecutor(max_workers=min(4, len(blocks))) as executor:
         futures = {executor.submit(process_block, key, data): (key, data)
-                  for key, data in blocks if len(data) > 1}
+                   for key, data in blocks if len(data) > 1}
 
         for future in as_completed(futures):
             block_results = future.result()
@@ -603,7 +621,7 @@ def detect_global_duplicates_optimized(df: pd.DataFrame, cache: ItemCache,
             representative = group_df.loc[rep_idx]
 
             group_scores = [p['score'] for p in all_pairs
-                          if p['item_i'].id in item_ids or p['item_j'].id in item_ids]
+                            if p['item_i'].id in item_ids or p['item_j'].id in item_ids]
             avg_score = np.mean(group_scores) if group_scores else 0
 
             groups_data.append({
@@ -631,7 +649,7 @@ def detect_global_duplicates_optimized(df: pd.DataFrame, cache: ItemCache,
             lambda x: 0 if x == MatchType.EXACT_REF.value else 1
         )
         all_groups_df = all_groups_df.sort_values(['sort_key', 'size', 'avg_score'],
-                                                 ascending=[True, False, False])
+                                                  ascending=[True, False, False])
         all_groups_df = all_groups_df.drop(columns=['sort_key'])
 
         execution_time = time.time() - start_time
@@ -784,20 +802,6 @@ def detect_column_names(df: pd.DataFrame) -> Dict[str, str]:
 
     return column_mapping
 
-# -------- Chargement local si disponible (MODIF NOUVELLE) --------
-def load_local_csv_if_available() -> Optional[Tuple[pd.DataFrame, ItemCache, str]]:
-    """
-    Charge export.csv localement s'il existe. Retourne (df, cache, filename) ou None si absent.
-    """
-    try:
-        if DEFAULT_FILE_PATH.exists() and DEFAULT_FILE_PATH.is_file():
-            file_bytes = DEFAULT_FILE_PATH.read_bytes()
-            df, cache = read_and_normalize_df(file_bytes, DEFAULT_FILE_PATH.name)
-            return df, cache, DEFAULT_FILE_PATH.name
-    except Exception as e:
-        st.warning(f"Impossible de lire le fichier local {DEFAULT_FILE_PATH}: {e}")
-    return None
-
 # -------- Interface Streamlit --------
 def main():
     # CSS personnalisé
@@ -923,7 +927,7 @@ def main():
     # Header
     st.markdown('<h1 class="main-header">🚀 Détection de Doublons - Saisie Multiple</h1>', unsafe_allow_html=True)
 
-    # Sidebar - Source des données (MODIF NOUVELLE)
+    # Sidebar - Source des données (Local prioritaire / Upload optionnel)
     with st.sidebar:
         st.markdown("### 📤 Source des données")
 
@@ -931,7 +935,6 @@ def main():
         use_local = False
 
         if local_file_available:
-            # Toggle pour utiliser le fichier local
             use_local = st.checkbox(
                 f"Utiliser le fichier local **{DEFAULT_FILE_NAME}**",
                 value=True,
@@ -954,9 +957,9 @@ def main():
                 with st.spinner(f"Chargement du fichier local {DEFAULT_FILE_NAME}..."):
                     res = load_local_csv_if_available()
                     if res is not None:
-                        df, cache, filename = res
+                        df, filename = res
                         st.session_state.df = df
-                        st.session_state.cache = cache
+                        st.session_state.cache = build_item_cache(df)  # <-- construit ItemCache via cache_resource
                         try:
                             st.session_state.file_hash = hashlib.md5(DEFAULT_FILE_PATH.read_bytes()).hexdigest()
                         except Exception:
@@ -970,16 +973,16 @@ def main():
                     else:
                         st.error("❌ Échec du chargement du fichier local. Veuillez utiliser l'upload.")
         else:
-            # Mode upload (comme avant)
+            # Mode upload
             if uploaded_file:
                 file_bytes = uploaded_file.getvalue()
                 file_hash = hashlib.md5(file_bytes).hexdigest()
 
                 if 'file_hash' not in st.session_state or st.session_state.file_hash != file_hash or st.session_state.get('source') != 'upload':
                     with st.spinner("Chargement et optimisation en cours..."):
-                        df, cache = read_and_normalize_df(file_bytes, uploaded_file.name)
+                        df = read_and_normalize_df(file_bytes, uploaded_file.name)  # <-- df seul
                         st.session_state.df = df
-                        st.session_state.cache = cache
+                        st.session_state.cache = build_item_cache(df)  # <-- construit ItemCache
                         st.session_state.file_hash = file_hash
                         st.session_state.filename = uploaded_file.name
                         st.session_state.source = 'upload'
@@ -995,7 +998,9 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🔄 Rafraîchir", use_container_width=True):
+                # Purge des caches Streamlit (utile sur Cloud après déploiement)
                 st.cache_data.clear()
+                st.cache_resource.clear()
                 # Préserver la source (local/upload)
                 source = st.session_state.get('source')
                 for key in list(st.session_state.keys()):
@@ -1018,7 +1023,7 @@ def main():
 
     # Main content
     if 'df' not in st.session_state:
-        st.info("👈 Chargez un fichier (local ou upload) dans la barre latérale pour commencer.")
+        st.info("👈 Veuillez choisir la source dans la barre latérale (local ou upload).")
         return
 
     # Données chargées
