@@ -7,13 +7,12 @@
 # - Matching SAP Name (Stock) ~ Description (PO)
 # - Orphelins + meilleur match (affiche PO description + PO Item Code)
 # - Background image + overlay + ALERTES ROUGES + DÉTAILS (journal anomalies)
+# - ✨ ENRICHI : PO Number, PO Date, Flag "PO ≠ Stock" dans les correspondances
 # -------------------------------------------------------------------
-
 import io
 import re
 import unicodedata
 from datetime import datetime
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -23,9 +22,6 @@ from pathlib import Path
 
 st.set_page_config(page_title="Comparaison Stock vs Commandes", layout="wide")
 
-# =========================
-# >>> THEME / BACKGROUND <<<
-# =========================
 def apply_background(image_path: str, overlay_rgba="rgba(255,255,255,0.85)"):
     """
     Applique une image de fond + un overlay translucide pour lire le contenu.
@@ -224,7 +220,6 @@ def clean_text(t: str) -> str:
 def token_set(text: str):
     return set(clean_text(text).split())
 
-from difflib import SequenceMatcher
 def similarity(a: str, b: str):
     """Similarité combinée: difflib + Jaccard (0.6/0.4)."""
     a_clean, b_clean = clean_text(a), clean_text(b)
@@ -253,9 +248,7 @@ def to_excel_bytes(df_dict: dict):
             pd.DataFrame(df).to_excel(writer, index=False, sheet_name=sheet[:31])
     return output.getvalue()
 
-# =========================
-# Sidebar: chargement
-# =========================
+
 st.sidebar.title("⚙️ Paramètres")
 
 st.sidebar.header("1) Charger les fichiers")
@@ -493,20 +486,39 @@ top_n_matches = st.sidebar.slider("Top-N correspondances par item", 1, 5, 3)
 orphans = res[(res["Stock (Total livré)"] > 0) & (res["Total commandé"] == 0)].copy()
 st.write(f"**Items orphelins détectés (stock > 0, aucune commande)** : {len(orphans)}")
 
-# Séries POs pour matching
+# =========================
+# >>>>>>> BLOC ENRICHI : Correspondances (PO Number, PO Date, Flag erreur)
+# =========================
+# Séries POs pour matching (ENRICHIES : PO Number + PO Date + Flag erreur)
 if po_desc_col and po_desc_col != "(aucune)" and po_desc_col in po_df.columns:
     po_desc_clean = po_df[po_desc_col].fillna("").astype(str)
 else:
     po_desc_clean = pd.Series(dtype=str)
 
-po_item_series = po_df["_item"].fillna("").astype(str)
+po_item_series = po_df["_item"].fillna("").astype(str).reset_index(drop=True)
 po_qty_series  = po_df["_qty"].reset_index(drop=True)
+
+# Essayer de récupérer automatiquement le numéro de PO s’il existe
+po_number_col_guess = guess_column(
+    po_df.columns,
+    ["po number", "po no", "po_n", "po id", "order number", "numéro po", "numero po", "reference", "ref po", "^po$"]
+)
+if po_number_col_guess and po_number_col_guess in po_df.columns:
+    po_number_series = po_df[po_number_col_guess].astype(str).fillna("").reset_index(drop=True)
+else:
+    po_number_series = pd.Series([np.nan] * len(po_df), dtype=object)
+
+# La date PO (_date) a déjà été construite plus haut à partir du mapping utilisateur
+po_date_series = (po_df["_date"].reset_index(drop=True)
+                  if "_date" in po_df.columns else pd.Series([pd.NaT] * len(po_df)))
 
 matches_rows = []
 if not orphans.empty and not po_desc_clean.empty and (stock_sapname_col and stock_sapname_col != "(aucune)"):
     po_desc_indexed = po_desc_clean.reset_index(drop=False)
     po_desc_indexed.columns = ["po_row_index", "po_description"]
-    po_desc_indexed["po_item_code"] = po_item_series.reset_index(drop=True)
+    po_desc_indexed["po_item_code"] = po_item_series
+    po_desc_indexed["po_number"]    = po_number_series
+    po_desc_indexed["po_date"]      = po_date_series
 
     for _, r in orphans.iterrows():
         stock_item   = r["Item Code"]
@@ -515,17 +527,26 @@ if not orphans.empty and not po_desc_clean.empty and (stock_sapname_col and stoc
 
         top_df = find_best_match(stock_name, po_desc_indexed["po_description"], top_n=top_n_matches)
 
+        # Récup champs PO additionnels via l'index de la ligne PO
         top_df["po_item_code"] = top_df["po_index"].apply(
             lambda i: po_desc_indexed.loc[i, "po_item_code"] if i in po_desc_indexed.index else np.nan
         )
         top_df["po_qty_line"] = top_df["po_index"].apply(
             lambda i: po_qty_series.iloc[i] if i < len(po_qty_series) else np.nan
         )
+        top_df["po_number"] = top_df["po_index"].apply(
+            lambda i: po_desc_indexed.loc[i, "po_number"] if i in po_desc_indexed.index else np.nan
+        )
+        top_df["po_date"] = top_df["po_index"].apply(
+            lambda i: po_desc_indexed.loc[i, "po_date"] if i in po_desc_indexed.index else pd.NaT
+        )
 
+        # Contexte Stock
         top_df["stock_item_code"] = stock_item
         top_df["stock_sap_name"]  = stock_name
         top_df["stock_qty"]       = stock_qty
 
+        # Filtre de similarité
         top_df = top_df[top_df["score"] >= similarity_threshold]
         if not top_df.empty:
             matches_rows.append(top_df)
@@ -533,22 +554,45 @@ if not orphans.empty and not po_desc_clean.empty and (stock_sapname_col and stoc
 if matches_rows:
     matches_df = pd.concat(matches_rows, ignore_index=True)
     matches_df["po_qty_line"] = pd.to_numeric(matches_df["po_qty_line"], errors="coerce")
+
+    # Agrégation avec nouvelles colonnes
     agg_matches = (matches_df
                    .groupby(["stock_item_code", "stock_sap_name", "po_description", "po_item_code"], dropna=False)
                    .agg(
                        similarity=("score", "max"),
                        stock_qty=("stock_qty", "first"),
-                       total_po_qty_assoc=("po_qty_line", "sum")
+                       total_po_qty_assoc=("po_qty_line", "sum"),
+                       po_number=("po_number", "first"),  # premier PO trouvé (pratique pour l’email)
+                       po_date=("po_date", "max")          # date la plus récente
                    ).reset_index())
+
+    # Flag d’erreur : quand le code item de la ligne PO ne correspond pas à l’item en stock
+    agg_matches["po_code_mismatch"] = np.where(
+        agg_matches["stock_item_code"].astype(str) != agg_matches["po_item_code"].astype(str),
+        "Oui", "Non"
+    )
+
+    # Mise au propre de la date
+    agg_matches["po_date"] = pd.to_datetime(agg_matches["po_date"], errors="coerce").dt.date
 else:
-    agg_matches = pd.DataFrame(columns=["stock_item_code", "stock_sap_name", "po_description", "po_item_code", "similarity", "stock_qty", "total_po_qty_assoc"])
+    agg_matches = pd.DataFrame(
+        columns=["stock_item_code", "stock_sap_name", "po_description", "po_item_code",
+                 "similarity", "stock_qty", "total_po_qty_assoc", "po_number", "po_date", "po_code_mismatch"]
+    )
 
 st.markdown("### 🧩 Correspondances proposées (SAP Name ~ Description PO)")
 if agg_matches.empty:
     st.info("Aucune correspondance proposée selon le seuil actuel. Essaie d’abaisser le seuil de similarité.")
 else:
+    # Ordre de colonnes pensé pour l’email
+    display_cols = [
+        "stock_item_code", "stock_sap_name",
+        "po_description", "po_item_code", "po_number", "po_date",
+        "similarity", "stock_qty", "total_po_qty_assoc",
+        "po_code_mismatch"
+    ]
     st.dataframe(
-        agg_matches.sort_values(["similarity", "stock_qty"], ascending=[False, False]),
+        agg_matches.sort_values(["similarity", "stock_qty"], ascending=[False, False])[display_cols],
         use_container_width=True
     )
 
@@ -564,7 +608,10 @@ if not agg_matches.empty:
                            "po_description": "PO description correspondante",
                            "po_item_code": "PO Item Code",
                            "similarity": "Similarité",
-                           "total_po_qty_assoc": "Total Qty PO (assoc.)"
+                           "total_po_qty_assoc": "Total Qty PO (assoc.)",
+                           "po_number": "PO Number",
+                           "po_date": "PO Date",
+                           "po_code_mismatch": "PO ≠ Stock ?"
                        }),
                               on=["Item Code", "SAP Name (Stock)"],
                               how="left"))
@@ -575,6 +622,9 @@ else:
     orphans_summary["PO Item Code"] = np.nan
     orphans_summary["Similarité"] = np.nan
     orphans_summary["Total Qty PO (assoc.)"] = np.nan
+    orphans_summary["PO Number"] = np.nan
+    orphans_summary["PO Date"] = np.nan
+    orphans_summary["PO ≠ Stock ?"] = np.nan
     orphans_summary["Match trouvé ?"] = "Non"
 
 st.markdown("### 📋 Orphelins — meilleur match (description & Item Code PO)")
@@ -596,6 +646,7 @@ with st.expander("ℹ️ Détails & contrôles qualité (clique pour ouvrir)"):
     - Détection **Orphelins** (stock > 0, aucune commande).
     - Matching par similarité **SAP Name** (Stock) ↔ **Description** (POs) + récupération **PO Item Code**.
     - Export Excel multi-feuilles : Comparaison, Orphans, Correspondances détaillées, Orphelins + meilleur match, Synthèse KPI.
+    - ✨ Nouvelles colonnes : **PO Number**, **PO Date**, **PO ≠ Stock ?** dans les correspondances.
     """)
 
     st.markdown("**Journal d’anomalies :**")
@@ -638,7 +689,8 @@ summary_df = pd.DataFrame({
 excel_bytes = to_excel_bytes({
     "Comparaison": res,
     "Orphans": orphans,
-    "Correspondances_détaillées": agg_matches,
+    # ✨ on exporte la table enrichie !
+    "Correspondances_détaillées": agg_matches.sort_values(["similarity", "stock_qty"], ascending=[False, False]),
     "Orphans_meilleur_match": orphans_summary,
     "Synthese_KPI": summary_df
 })
