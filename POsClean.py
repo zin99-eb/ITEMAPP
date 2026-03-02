@@ -1,6 +1,7 @@
 # ============================================================
-# app.py — Détection des POs en doublons V4.4
+# app.py — Détection des POs en doublons V4.6
 # Avec détection intelligente des POs récurrents vs vrais doublons
+# Et comparaison avancée par nom
 # ============================================================
 
 import streamlit as st
@@ -16,7 +17,7 @@ import re
 # CONFIG STREAMLIT
 # ==============================
 st.set_page_config(page_title="Détection POs en doublons", page_icon="🔍", layout="wide")
-st.title("🎯 Détection des POs en doublons — V4.4 (POs récurrents vs Doublons)")
+st.title("🎯 Détection des POs en doublons — V4.6 (Détection améliorée des récurrents)")
 
 # ==============================
 # FONCTIONS D'ANALYSE DES NOMS
@@ -38,16 +39,35 @@ def detect_recurrent_po(name1, name2):
     mois_en = ['january', 'february', 'march', 'april', 'may', 'june',
                'july', 'august', 'september', 'october', 'november', 'december']
     
-    # Chercher des mois dans les noms
+    # Compter combien de mois sont trouvés dans chaque nom
     mois_trouves_1 = [mois for mois in mois_fr + mois_en if mois in name1_lower]
     mois_trouves_2 = [mois for mois in mois_fr + mois_en if mois in name2_lower]
     
-    # Si les deux ont des mois différents, c'est probablement une récurrence
+    # CAS 1: Les deux ont des mois différents -> récurrence
     if mois_trouves_1 and mois_trouves_2:
         if mois_trouves_1[0] != mois_trouves_2[0]:
-            return True
+            # Vérifier que le reste du nom est très similaire
+            # Enlever les mois des noms pour comparer la base
+            base1 = name1_lower
+            base2 = name2_lower
+            for mois in mois_trouves_1 + mois_trouves_2:
+                base1 = base1.replace(mois, "")
+                base2 = base2.replace(mois, "")
+            
+            # Nettoyer les espaces
+            base1 = ' '.join(base1.split())
+            base2 = ' '.join(base2.split())
+            
+            # Si les bases sont très similaires, c'est une récurrence
+            similarity = SequenceMatcher(None, base1, base2).ratio()
+            if similarity > 0.8:
+                return True
     
-    # Chercher des patterns de date (MOIS DE XXX)
+    # CAS 2: Un seul a un mois, l'autre non -> potentiel doublon
+    if (mois_trouves_1 and not mois_trouves_2) or (not mois_trouves_1 and mois_trouves_2):
+        return False
+    
+    # CAS 3: Chercher des patterns spécifiques avec "MOIS DE XXX"
     pattern_mois = r'(mois de|mois d\'|month of|for)\s+([a-zA-Zéèêëàâäôöûüç]+)'
     mois_match_1 = re.search(pattern_mois, name1_lower)
     mois_match_2 = re.search(pattern_mois, name2_lower)
@@ -56,9 +76,15 @@ def detect_recurrent_po(name1, name2):
         mois_1 = mois_match_1.group(2)
         mois_2 = mois_match_2.group(2)
         if mois_1 != mois_2:
-            return True
+            # Vérifier que le texte avant "mois de" est similaire
+            before_1 = name1_lower[:mois_match_1.start()].strip()
+            before_2 = name2_lower[:mois_match_2.start()].strip()
+            
+            similarity = SequenceMatcher(None, before_1, before_2).ratio()
+            if similarity > 0.8:
+                return True
     
-    # Chercher des numéros de semaine ou période
+    # CAS 4: Chercher des numéros de semaine ou période
     pattern_periode = r'(semaine|week|période|period)\s+(\d+)'
     periode_match_1 = re.search(pattern_periode, name1_lower)
     periode_match_2 = re.search(pattern_periode, name2_lower)
@@ -67,7 +93,13 @@ def detect_recurrent_po(name1, name2):
         periode_1 = periode_match_1.group(2)
         periode_2 = periode_match_2.group(2)
         if periode_1 != periode_2:
-            return True
+            # Vérifier que le texte avant est similaire
+            before_1 = name1_lower[:periode_match_1.start()].strip()
+            before_2 = name2_lower[:periode_match_2.start()].strip()
+            
+            similarity = SequenceMatcher(None, before_1, before_2).ratio()
+            if similarity > 0.8:
+                return True
     
     return False
 
@@ -205,6 +237,7 @@ def detect_doublons_intelligent(df: pd.DataFrame,
                                date_window: int,
                                use_supplier: bool,
                                use_amount: bool,
+                               use_name_similarity: bool,
                                detect_recurrent: bool,
                                strict_mode: bool) -> pd.DataFrame:
     """
@@ -288,10 +321,48 @@ def detect_doublons_intelligent(df: pd.DataFrame,
                 
                 r1, r2 = company_data.iloc[i], company_data.iloc[j]
                 
+                # Vérifier si ce sont des POs récurrents en premier
+                if has_name and detect_recurrent:
+                    name1 = r1.get("name", "")
+                    name2 = r2.get("name", "")
+                    
+                    # Vérifier d'abord si ce sont des récurrents
+                    if detect_recurrent_po(name1, name2):
+                        # Ce sont des POs récurrents, pas des doublons
+                        base1, base2 = extract_common_base(name1, name2)
+                        smart_sim = calculate_smart_similarity(name1, name2, base1, base2)
+                        
+                        if smart_sim > 0.7:  # Seuil pour capturer les récurrents
+                            type_po = "PO RECURRENT"
+                            categorie = "NORMAL"
+                            score = 0.3  # Score bas car ce n'est pas un doublon
+                            raisons = [f"Service récurrent mensuel (similarité base: {smart_sim:.2f})"]
+                            
+                            # Ajouter aux résultats si l'utilisateur veut voir les récurrents
+                            if st.session_state.get('show_recurrent', False):
+                                results.append({
+                                    "Company": company,
+                                    "PO1": po1,
+                                    "PO2": po2,
+                                    "Nom1": name1,
+                                    "Nom2": name2,
+                                    "Supplier1": r1.get("Supplier", ""),
+                                    "Supplier2": r2.get("Supplier", ""),
+                                    "Montant1": r1.get("PrixTotalUSD", np.nan),
+                                    "Montant2": r2.get("PrixTotalUSD", np.nan),
+                                    "Date1": date1,
+                                    "Date2": date2,
+                                    "Score": round(score, 3),
+                                    "Raisons": ", ".join(raisons),
+                                    "Type": type_po,
+                                    "Categorie": categorie
+                                })
+                            continue  # Passer à la paire suivante
+                
                 # Vérifier si strict mode est activé
                 if strict_mode:
                     # En mode strict, on ne détecte que les doublons parfaits
-                    if not (has_supp and has_price):
+                    if not (has_supp and has_price and has_name):
                         continue
                     
                     supp1 = str(r1.get("Supplier", "")).strip()
@@ -303,12 +374,34 @@ def detect_doublons_intelligent(df: pd.DataFrame,
                     except (ValueError, TypeError):
                         continue
                     
-                    if supp1 == supp2 and abs(amt1 - amt2) < 0.01:
+                    name1 = clean_text_fast(str(r1.get("name", "")))
+                    name2 = clean_text_fast(str(r2.get("name", "")))
+                    name_similarity = SequenceMatcher(None, name1, name2).ratio()
+                    
+                    if supp1 == supp2 and abs(amt1 - amt2) < 0.01 and name_similarity > 0.8:
                         # C'est un doublon parfait
                         type_po = "DOUBLON PARFAIT"
                         categorie = "DOUBLON REEL"
                         score = 1.0
-                        raisons = "Même fournisseur + même montant exact"
+                        raisons = "Même fournisseur + même montant + noms très similaires"
+                        
+                        results.append({
+                            "Company": company,
+                            "PO1": po1,
+                            "PO2": po2,
+                            "Nom1": r1.get("name", ""),
+                            "Nom2": r2.get("name", ""),
+                            "Supplier1": supp1,
+                            "Supplier2": supp2,
+                            "Montant1": amt1,
+                            "Montant2": amt2,
+                            "Date1": date1,
+                            "Date2": date2,
+                            "Score": score,
+                            "Raisons": raisons,
+                            "Type": type_po,
+                            "Categorie": categorie
+                        })
                     else:
                         continue  # Passer au suivant en mode strict
                 else:
@@ -336,62 +429,80 @@ def detect_doublons_intelligent(df: pd.DataFrame,
                         except (ValueError, TypeError):
                             pass
                     
-                    # Vérifier si ce sont des POs récurrents
-                    if has_name and detect_recurrent:
+                    # Vérifier la similarité des noms
+                    if has_name and use_name_similarity:
                         name1 = r1.get("name", "")
                         name2 = r2.get("name", "")
                         
-                        if detect_recurrent_po(name1, name2):
-                            # Ce sont des POs récurrents, pas des doublons
-                            base1, base2 = extract_common_base(name1, name2)
-                            smart_sim = calculate_smart_similarity(name1, name2, base1, base2)
+                        if name1 and name2:
+                            # Nettoyer les noms pour la comparaison
+                            name1_clean = clean_text_fast(str(name1))
+                            name2_clean = clean_text_fast(str(name2))
                             
-                            if smart_sim > 0.8:
-                                type_po = "PO RECURRENT"
-                                categorie = "NORMAL"
-                                score = 0.3  # Score bas car ce n'est pas un doublon
-                                raisons.append(f"Service récurrent (similarité base: {smart_sim:.2f})")
+                            # Calculer la similarité
+                            name_similarity = SequenceMatcher(None, name1_clean, name2_clean).ratio()
+                            
+                            if name_similarity > 0.8:  # Seuil de similarité élevé
+                                score += 0.5
+                                raisons.append(f"Noms très similaires ({name_similarity:.0%})")
+                            elif name_similarity > 0.6:  # Similarité moyenne
+                                score += 0.3
+                                raisons.append(f"Noms partiellement similaires ({name_similarity:.0%})")
+                            
+                            # Vérifier si les noms sont identiques après nettoyage
+                            if name1_clean == name2_clean:
+                                score += 0.3
+                                raisons.append("Noms identiques après nettoyage")
                     
-                    # Doublon parfait (fournisseur + montant)
-                    if (has_supp and has_price and use_supplier and use_amount and
-                        "Même fournisseur" in raisons and "Même montant" in raisons):
+                    # Doublon parfait (fournisseur + montant + nom très similaire)
+                    if (has_supp and has_price and has_name and use_supplier and use_amount and use_name_similarity and
+                        "Même fournisseur" in raisons and "Même montant" in raisons and 
+                        any("Noms très similaires" in r or "Noms identiques" in r for r in raisons)):
                         type_po = "DOUBLON PARFAIT"
                         categorie = "DOUBLON REEL"
                         score = 1.0
-                        raisons = ["Même fournisseur + même montant exact (DOUBLON REEL)"]
-                
-                # Déterminer si on ajoute aux résultats
-                ajouter = False
-                
-                if strict_mode:
-                    ajouter = True  # En mode strict, on a déjà filtré
-                elif type_po == "DOUBLON REEL":
-                    ajouter = True
-                elif type_po == "DOUBLON PARFAIT":
-                    ajouter = True
-                elif score >= 0.8 and type_po != "PO RECURRENT":
-                    ajouter = True
-                elif type_po == "PO RECURRENT" and st.session_state.get('show_recurrent', False):
-                    ajouter = True  # Seulement si l'utilisateur veut voir les récurrents
-                
-                if ajouter:
-                    results.append({
-                        "Company": company,
-                        "PO1": po1,
-                        "PO2": po2,
-                        "Nom1": r1.get("name", ""),
-                        "Nom2": r2.get("name", ""),
-                        "Supplier1": r1.get("Supplier", ""),
-                        "Supplier2": r2.get("Supplier", ""),
-                        "Montant1": r1.get("PrixTotalUSD", np.nan),
-                        "Montant2": r2.get("PrixTotalUSD", np.nan),
-                        "Date1": date1,
-                        "Date2": date2,
-                        "Score": round(score, 3),
-                        "Raisons": ", ".join(raisons),
-                        "Type": type_po,
-                        "Categorie": categorie
-                    })
+                        raisons = ["Même fournisseur + même montant + noms très similaires (DOUBLON REEL)"]
+                    
+                    # Doublon fournisseur + nom (sans montant)
+                    elif (has_supp and has_name and use_supplier and use_name_similarity and
+                          "Même fournisseur" in raisons and 
+                          any("Noms très similaires" in r or "Noms identiques" in r for r in raisons)):
+                        type_po = "DOUBLON POTENTIEL"
+                        categorie = "A ANALYSER"
+                        if score < 0.8:
+                            score = 0.8
+                        raisons.append("À vérifier (même fournisseur + noms similaires)")
+                    
+                    # Déterminer si on ajoute aux résultats
+                    ajouter = False
+                    
+                    if strict_mode:
+                        ajouter = True  # En mode strict, on a déjà filtré
+                    elif type_po == "DOUBLON REEL":
+                        ajouter = True
+                    elif type_po == "DOUBLON PARFAIT":
+                        ajouter = True
+                    elif score >= 0.8 and type_po != "PO RECURRENT":
+                        ajouter = True
+                    
+                    if ajouter:
+                        results.append({
+                            "Company": company,
+                            "PO1": po1,
+                            "PO2": po2,
+                            "Nom1": r1.get("name", ""),
+                            "Nom2": r2.get("name", ""),
+                            "Supplier1": r1.get("Supplier", ""),
+                            "Supplier2": r2.get("Supplier", ""),
+                            "Montant1": r1.get("PrixTotalUSD", np.nan),
+                            "Montant2": r2.get("PrixTotalUSD", np.nan),
+                            "Date1": date1,
+                            "Date2": date2,
+                            "Score": round(score, 3),
+                            "Raisons": ", ".join(raisons) if isinstance(raisons, list) else raisons,
+                            "Type": type_po,
+                            "Categorie": categorie
+                        })
     
     return pd.DataFrame(results)
 
@@ -433,17 +544,19 @@ detection_mode = col3.selectbox(
 )
 
 st.markdown("**Critères de détection:**")
-col4, col5, col6, col7 = st.columns(4)
+col4, col5, col6, col7, col8 = st.columns(5)
 
 use_supplier = col4.checkbox("Même fournisseur", value=True)
 use_amount = col5.checkbox("Même montant", value=True)
-detect_recurrent = col6.checkbox("Détecter POs récurrents", value=True)
+use_name_similarity = col6.checkbox("Noms similaires", value=True, 
+                                   help="Détecter les POs avec des noms très similaires")
+detect_recurrent = col7.checkbox("Détecter POs récurrents", value=True)
 
 # Initialiser session state pour l'option d'affichage
 if 'show_recurrent' not in st.session_state:
     st.session_state.show_recurrent = False
 
-show_recurrent = col7.checkbox(
+show_recurrent = col8.checkbox(
     "Afficher POs récurrents", 
     value=st.session_state.show_recurrent,
     help="Afficher les POs qui sont des récurrences normales (même service, mois différent)"
@@ -477,6 +590,7 @@ if st.button("🚀 Démarrer l'analyse intelligente", type="primary"):
             date_window,
             use_supplier,
             use_amount,
+            use_name_similarity,
             detect_recurrent,
             strict_mode
         )
@@ -493,7 +607,7 @@ if st.button("🚀 Démarrer l'analyse intelligente", type="primary"):
     # =======================
     # 📊 ANALYSE DES RÉSULTATS
     # =======================
-    st.success("✅ Analyse terminée avec distinction des POs récurrents !")
+    st.success("✅ Analyse terminée avec distinction des POs récurrents et comparaison des noms !")
     
     if not doublons_df.empty:
         # Statistiques par catégorie
@@ -533,12 +647,12 @@ if st.button("🚀 Démarrer l'analyse intelligente", type="primary"):
                 st.warning("""
                 **⚠️ ATTENTION : DOUBLONS RÉELS DÉTECTÉS !**
                 
-                Ces POs ont soit la **même référence**, soit le **même fournisseur + même montant exact**.
+                Ces POs ont soit la **même référence**, soit le **même fournisseur + même montant exact + noms très similaires**.
                 Il s'agit très probablement de véritables doublons qui nécessitent une action immédiate.
                 """)
                 
                 # Afficher les colonnes importantes
-                cols_to_show = ["Company", "PO1", "PO2", "Nom1", "Supplier1", "Montant1", "Date1", "Date2", "Raisons"]
+                cols_to_show = ["Company", "PO1", "PO2", "Nom1", "Nom2", "Supplier1", "Montant1", "Date1", "Date2", "Raisons"]
                 cols_to_show = [c for c in cols_to_show if c in reel_df.columns]
                 
                 st.dataframe(reel_df[cols_to_show].sort_values("Date1"), use_container_width=True)
@@ -566,14 +680,15 @@ if st.button("🚀 Démarrer l'analyse intelligente", type="primary"):
                 - Des erreurs de saisie
                 """)
                 
-                # Ajouter une colonne d'action recommandée
+                # Ajouter une colonne d'action recommandée basée sur les raisons
                 analyser_df["Action recommandée"] = analyser_df.apply(
-                    lambda row: "Vérifier avec le demandeur" if "Même fournisseur" in row["Raisons"] 
-                    else "Contacter le service achats",
+                    lambda row: "Vérifier avec le demandeur" if "Même fournisseur" in str(row["Raisons"]) 
+                    else "Contacter le service achats" if "Noms similaires" in str(row["Raisons"])
+                    else "Analyse approfondie nécessaire",
                     axis=1
                 )
                 
-                cols_to_show = ["Company", "PO1", "PO2", "Nom1", "Supplier1", "Montant1", "Score", "Raisons", "Action recommandée"]
+                cols_to_show = ["Company", "PO1", "PO2", "Nom1", "Nom2", "Supplier1", "Montant1", "Score", "Raisons", "Action recommandée"]
                 cols_to_show = [c for c in cols_to_show if c in analyser_df.columns]
                 
                 st.dataframe(analyser_df[cols_to_show].sort_values("Score", ascending=False), 
@@ -593,7 +708,7 @@ if st.button("🚀 Démarrer l'analyse intelligente", type="primary"):
             if recurrents > 0:
                 recurrent_df = doublons_df[doublons_df["Categorie"] == "NORMAL"]
                 st.success("""
-                **🔄 POs RÉCURRENTS (NORMALS)**
+                **🔄 POs RÉCURRENTS (NORMAUX)**
                 
                 Ces POs sont pour le même service mais à des périodes différentes (ex: janvier, février).
                 Il s'agit de commandes régulières normales, PAS de doublons.
@@ -786,11 +901,18 @@ if st.button("🚀 Démarrer l'analyse intelligente", type="primary"):
 with st.sidebar:
     st.markdown("## 🎯 Détection intelligente")
     st.markdown("""
-    **Nouveautés V4.4 :**
+    **Nouveautés V4.6 :**
+    
+    🔍 **DÉTECTION AMÉLIORÉE DES RÉCURRENTS**
+    - Détection intelligente des mois (janvier, février, etc.)
+    - Reconnaissance des patterns "MOIS DE XXX"
+    - Comparaison avancée des bases de noms
+    - Priorité à la détection des récurrents avant les doublons
     
     🔴 **DOUBLONS RÉELS**
     - Même référence PO
     - Même fournisseur + même montant exact
+    - Même fournisseur + noms très similaires (>80%)
     - Nécessite action immédiate
     
     🟡 **À ANALYSER**
@@ -803,34 +925,37 @@ with st.sidebar:
     - Commandes régulières normales
     - Pas d'action nécessaire
     
-    **Exemple de POs récurrents :**
-    - "Gardiennage janvier" vs "Gardiennage février"
-    - "Maintenance mars" vs "Maintenance avril"
-    - "Abonnement logiciel Q1" vs "Abonnement logiciel Q2"
+    **Exemple traité avec succès :**
+    - "Gardiennage MOIS DE JANVIER 2025"
+    - "Gardiennage MOIS DE FÉVRIER 2025"
+    → Classé comme **PO RÉCURRENT** ✅
     """)
     
     st.markdown("---")
     st.markdown("## ⚙️ Comment ça marche ?")
     st.markdown("""
     1. **Analyse linguistique** des noms de PO
-    2. **Détection des mois/périodes** différents
-    3. **Extraction de la base commune** (sans dates)
-    4. **Classification intelligente** en 3 catégories
-    5. **Recommandations adaptées** pour chaque cas
+    2. **Détection prioritaire des récurrents** (mois, périodes)
+    3. **Comparaison de similarité** des noms
+    4. **Extraction de la base commune** (sans dates)
+    5. **Classification intelligente** en 3 catégories
+    6. **Recommandations adaptées** pour chaque cas
     """)
     
     st.markdown("---")
     st.markdown("## 📊 Paramètres conseillés")
     st.markdown("""
-    **Pour audit strict :**
+    **Pour audit mensuel :**
     - Mode : Intelligent
-    - Fenêtre : 30 jours
+    - Fenêtre : 35 jours (pour capturer mois consécutifs)
+    - Critères : Tous activés
     - Détecter récurrents : OUI
-    - Afficher récurrents : NON
+    - Afficher récurrents : NON (pour focus sur doublons)
     
     **Pour analyse complète :**
     - Mode : Intelligent  
-    - Fenêtre : 60 jours
+    - Fenêtre : 90 jours
+    - Critères : Tous activés
     - Détecter récurrents : OUI
-    - Afficher récurrents : OUI
+    - Afficher récurrents : OUI (pour voir tous les patterns)
     """)

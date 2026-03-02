@@ -1,7 +1,7 @@
 # ================================================================
 # Items — Connexion Directe au Data Warehouse Netis Group
 # Auteur : Zineb FAKKAR – Fév 2026
-# Version corrigée avec persistance de la sélection des groupes
+# Version avec IA Master Data Quality intégrée
 # ================================================================
 import streamlit as st
 import pandas as pd
@@ -15,8 +15,8 @@ from functools import lru_cache
 from sentence_transformers import SentenceTransformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Set
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Set, Any
 import warnings
 import zipfile
 from sqlalchemy import create_engine, text
@@ -51,7 +51,7 @@ def init_connection_params():
             'query': """SELECT * 
 FROM "SCM"."API_Items" 
 WHERE created_at >= '2024-01-01' 
-AND status = 'Qualified'AND type = 0.0"""
+AND status = 'Qualified' AND type = 0.0"""
         }
 
 def create_connection_string(config):
@@ -153,6 +153,8 @@ def refresh_data():
         del st.session_state.last_load
     if 'selected_group' in st.session_state:
         del st.session_state.selected_group
+    if 'last_quality_report' in st.session_state:
+        del st.session_state.last_quality_report
     st.rerun()
 
 # ================================================================
@@ -703,6 +705,561 @@ def build_temp_groups(df: pd.DataFrame) -> pd.DataFrame:
     return temp
 
 # ================================================================
+# === IA MASTER DATA QUALITY - Analyseur de qualité des données
+# ================================================================
+
+@dataclass
+class DataQualityIssue:
+    """Classe pour représenter une anomalie détectée"""
+    severity: str  # 'CRITICAL', 'MAJOR', 'MINOR', 'WARNING', 'INFO'
+    category: str  # 'DUPLICATE', 'MISSING', 'FORMAT', 'CONSISTENCY', 'REFERENCE', 'SEMANTIC'
+    field: str
+    message: str
+    count: int
+    examples: List[Any] = field(default_factory=list)
+    recommendation: str = ""
+    impact: str = ""
+
+class MasterDataQualityAI:
+    """
+    IA spécialisée dans l'analyse de la qualité des données Master Data
+    Détecte les anomalies, erreurs et non-conformités
+    """
+    
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.copy()
+        self.issues: List[DataQualityIssue] = []
+        self.score = 100  # Score de qualité initial (0-100)
+        self.total_items = len(df)
+        
+    def analyze(self) -> Dict:
+        """Lance l'analyse complète de la qualité des données"""
+        
+        # 1. Analyse des doublons
+        self._check_duplicates()
+        
+        # 2. Analyse des valeurs manquantes
+        self._check_missing_values()
+        
+        # 3. Analyse du format des données
+        self._check_data_formats()
+        
+        # 4. Analyse de la cohérence
+        self._check_consistency()
+        
+        # 5. Analyse des références
+        self._check_references()
+        
+        # 6. Analyse sémantique des noms
+        self._check_name_quality()
+        
+        # 7. Analyse temporelle
+        self._check_temporal_quality()
+        
+        # 8. Analyse des types et catégories
+        self._check_categories()
+        
+        # Calculer le score final
+        self._calculate_quality_score()
+        
+        return {
+            'score': self.score,
+            'issues': self.issues,
+            'summary': self._generate_summary(),
+            'recommendations': self._generate_recommendations(),
+            'grade': self._get_grade()
+        }
+    
+    def _check_duplicates(self):
+        """Détecte les différents types de doublons"""
+        
+        # Doublons exacts sur le nom
+        if 'item_name' in self.df.columns:
+            exact_dupes = self.df[self.df.duplicated(subset=['item_name'], keep=False)]
+            if len(exact_dupes) > 0:
+                examples = exact_dupes['item_name'].head(3).tolist()
+                self.issues.append(DataQualityIssue(
+                    severity='CRITICAL' if len(exact_dupes) > 10 else 'MAJOR',
+                    category='DUPLICATE',
+                    field='item_name',
+                    message=f"{len(exact_dupes)} doublons exacts détectés",
+                    count=len(exact_dupes),
+                    examples=examples,
+                    recommendation="Fusionner les doublons ou archiver les versions inactives",
+                    impact=f"Perte de {len(exact_dupes) - self.df['item_name'].nunique()} références uniques"
+                ))
+                self.score -= min(15, len(exact_dupes) // 10)
+        
+        # Doublons sur la référence
+        if 'reference' in self.df.columns:
+            ref_dupes = self.df[self.df.duplicated(subset=['reference'], keep=False)]
+            if len(ref_dupes) > 0:
+                self.issues.append(DataQualityIssue(
+                    severity='CRITICAL',
+                    category='DUPLICATE',
+                    field='reference',
+                    message=f"{len(ref_dupes)} références en double",
+                    count=len(ref_dupes),
+                    examples=ref_dupes['reference'].head(3).tolist(),
+                    recommendation="Chaque référence doit être unique dans le système",
+                    impact="Risque d'erreurs dans les commandes et le suivi"
+                ))
+                self.score -= 20
+    
+    def _check_missing_values(self):
+        """Vérifie les valeurs manquantes critiques"""
+        
+        critical_fields = ['item_name', 'reference', 'status']
+        for field in critical_fields:
+            if field in self.df.columns:
+                missing = self.df[field].isna() | (self.df[field] == '') | (self.df[field] == '0') | (self.df[field] == 'NULL')
+                missing_count = missing.sum()
+                
+                if missing_count > 0:
+                    severity = 'CRITICAL' if missing_count > self.total_items * 0.1 else 'MAJOR'
+                    
+                    self.issues.append(DataQualityIssue(
+                        severity=severity,
+                        category='MISSING',
+                        field=field,
+                        message=f"{missing_count} items sans {field} ({missing_count/self.total_items*100:.1f}%)",
+                        count=missing_count,
+                        recommendation=f"Renseigner le champ {field} pour tous les items",
+                        impact=f"{missing_count} items inutilisables sans cette information"
+                    ))
+                    self.score -= missing_count // 5
+    
+    def _check_data_formats(self):
+        """Vérifie le format des données"""
+        
+        # Format des références
+        if 'reference' in self.df.columns:
+            # Références trop courtes
+            invalid_refs = self.df[
+                (self.df['reference'].astype(str).str.len() < 3) & 
+                (self.df['reference'] != '')
+            ]
+            if len(invalid_refs) > 0:
+                self.issues.append(DataQualityIssue(
+                    severity='MAJOR',
+                    category='FORMAT',
+                    field='reference',
+                    message=f"{len(invalid_refs)} références trop courtes (< 3 caractères)",
+                    count=len(invalid_refs),
+                    examples=invalid_refs['reference'].head(3).tolist(),
+                    recommendation="Les références doivent avoir au moins 3 caractères",
+                    impact="Difficulté d'identification et de recherche"
+                ))
+                self.score -= 5
+        
+        # Format des dates
+        if 'created_at' in self.df.columns:
+            try:
+                pd.to_datetime(self.df['created_at'], errors='raise')
+            except:
+                self.issues.append(DataQualityIssue(
+                    severity='MAJOR',
+                    category='FORMAT',
+                    field='created_at',
+                    message="Format de date invalide détecté dans certaines lignes",
+                    count=len(self.df),
+                    recommendation="Uniformiser le format des dates (YYYY-MM-DD)",
+                    impact="Impossible d'analyser les tendances temporelles"
+                ))
+                self.score -= 10
+        
+        # Prix négatifs ou nuls
+        if 'purchase_price' in self.df.columns:
+            try:
+                invalid_prices = self.df[
+                    (pd.to_numeric(self.df['purchase_price'], errors='coerce') <= 0) &
+                    (self.df['purchase_price'] != '')
+                ]
+                if len(invalid_prices) > 0:
+                    self.issues.append(DataQualityIssue(
+                        severity='WARNING',
+                        category='FORMAT',
+                        field='purchase_price',
+                        message=f"{len(invalid_prices)} prix invalides (<= 0)",
+                        count=len(invalid_prices),
+                        recommendation="Vérifier les valeurs des prix",
+                        impact="Valorisation incorrecte du stock"
+                    ))
+            except:
+                pass
+    
+    def _check_consistency(self):
+        """Vérifie la cohérence entre les champs"""
+        
+        # Vérifier le statut actif/inactif
+        if 'active' in self.df.columns and 'stock' in self.df.columns:
+            try:
+                active_without_stock = self.df[
+                    (self.df['active'] == '1') & 
+                    (pd.to_numeric(self.df['stock'], errors='coerce') == 0)
+                ]
+                if len(active_without_stock) > 0:
+                    self.issues.append(DataQualityIssue(
+                        severity='WARNING',
+                        category='CONSISTENCY',
+                        field='active/stock',
+                        message=f"{len(active_without_stock)} items actifs sans stock",
+                        count=len(active_without_stock),
+                        recommendation="Vérifier si ces items doivent vraiment être actifs",
+                        impact="Risque de rupture de stock non détectée"
+                    ))
+            except:
+                pass
+    
+    def _check_references(self):
+        """Vérifie l'intégrité référentielle"""
+        
+        # Pattern de références par catégorie (à personnaliser selon vos règles)
+        ref_patterns = {
+            'IT': r'^IT[A-Z]{2}-\d{4}$',
+            'ELEC': r'^ELEC-\d{4}$',
+            'MECA': r'^MECA-\d{4}$',
+            'COS': r'^COS-\d{4}$'
+        }
+        
+        if 'reference' in self.df.columns and 'category_name' in self.df.columns:
+            for category, pattern in ref_patterns.items():
+                cat_items = self.df[self.df['category_name'].str.contains(category, na=False, case=False)]
+                if len(cat_items) > 0:
+                    invalid_refs = cat_items[~cat_items['reference'].astype(str).str.match(pattern, na=False)]
+                    if len(invalid_refs) > 0:
+                        self.issues.append(DataQualityIssue(
+                            severity='MAJOR',
+                            category='REFERENCE',
+                            field='reference',
+                            message=f"{len(invalid_refs)} références {category} non conformes au format standard",
+                            count=len(invalid_refs),
+                            examples=invalid_refs['reference'].head(3).tolist(),
+                            recommendation=f"Les références {category} doivent suivre le format: {pattern}",
+                            impact="Non-respect des standards de nommage"
+                        ))
+                        self.score -= 8
+    
+    def _check_name_quality(self):
+        """Analyse la qualité des noms (sémantique)"""
+        
+        if 'item_name' not in self.df.columns:
+            return
+        
+        # Noms trop courts
+        short_names = self.df[self.df['item_name'].astype(str).str.len() < 5]
+        if len(short_names) > 0:
+            self.issues.append(DataQualityIssue(
+                severity='MAJOR',
+                category='SEMANTIC',
+                field='item_name',
+                message=f"{len(short_names)} noms trop courts (< 5 caractères)",
+                count=len(short_names),
+                examples=short_names['item_name'].head(3).tolist(),
+                recommendation="Les noms d'items doivent être descriptifs (minimum 5 caractères)",
+                impact="Difficulté d'identification et de recherche"
+            ))
+            self.score -= 8
+        
+        # Noms avec caractères spéciaux
+        special_chars = self.df[self.df['item_name'].astype(str).str.contains(r'[^a-zA-Z0-9\s\-\.\(\)]', na=False)]
+        if len(special_chars) > 0:
+            self.issues.append(DataQualityIssue(
+                severity='MINOR',
+                category='FORMAT',
+                field='item_name',
+                message=f"{len(special_chars)} noms contiennent des caractères spéciaux non standards",
+                count=len(special_chars),
+                examples=special_chars['item_name'].head(3).tolist(),
+                recommendation="Éviter les caractères spéciaux dans les noms (sauf - . ())",
+                impact="Problèmes potentiels d'export et d'intégration"
+            ))
+            self.score -= 3
+        
+        # Noms en majuscules uniquement
+        all_upper = self.df[self.df['item_name'].astype(str).str.isupper()]
+        if len(all_upper) > 0:
+            self.issues.append(DataQualityIssue(
+                severity='INFO',
+                category='FORMAT',
+                field='item_name',
+                message=f"{len(all_upper)} noms en majuscules uniquement",
+                count=len(all_upper),
+                recommendation="Privilégier la casse mixte (première lettre en majuscule)",
+                impact="Problème esthétique uniquement"
+            ))
+    
+    def _check_temporal_quality(self):
+        """Vérifie la qualité temporelle des données"""
+        
+        if 'created_at' in self.df.columns:
+            try:
+                dates = pd.to_datetime(self.df['created_at'], errors='coerce')
+                now = datetime.now()
+                
+                # Dates futures
+                future_dates = dates[dates > now]
+                if len(future_dates) > 0:
+                    self.issues.append(DataQualityIssue(
+                        severity='CRITICAL',
+                        category='CONSISTENCY',
+                        field='created_at',
+                        message=f"{len(future_dates)} dates de création dans le futur",
+                        count=len(future_dates),
+                        examples=self.df.loc[future_dates.index, 'item_name'].head(3).tolist(),
+                        recommendation="Corriger les dates futures",
+                        impact="Incohérence dans la chronologie des données"
+                    ))
+                    self.score -= 15
+                
+                # Dates trop anciennes (> 5 ans)
+                old_dates = dates[dates < now - pd.Timedelta(days=5*365)]
+                if len(old_dates) > 0:
+                    self.issues.append(DataQualityIssue(
+                        severity='INFO',
+                        category='TEMPORAL',
+                        field='created_at',
+                        message=f"{len(old_dates)} items très anciens (> 5 ans)",
+                        count=len(old_dates),
+                        recommendation="Vérifier si ces items sont toujours pertinents",
+                        impact="Données potentiellement obsolètes"
+                    ))
+            except Exception as e:
+                pass
+    
+    def _check_categories(self):
+        """Analyse la qualité des catégories"""
+        
+        if 'category_name' in self.df.columns:
+            # Catégories vides
+            empty_cats = self.df[self.df['category_name'].isna() | (self.df['category_name'] == '')]
+            if len(empty_cats) > 0:
+                self.issues.append(DataQualityIssue(
+                    severity='MAJOR',
+                    category='MISSING',
+                    field='category_name',
+                    message=f"{len(empty_cats)} items sans catégorie",
+                    count=len(empty_cats),
+                    recommendation="Tous les items doivent avoir une catégorie",
+                    impact="Impossible de classifier et regrouper les items"
+                ))
+                self.score -= 10
+            
+            # Catégories avec trop peu d'items
+            cat_counts = self.df['category_name'].value_counts()
+            rare_cats = cat_counts[cat_counts < 3]
+            if len(rare_cats) > 0:
+                self.issues.append(DataQualityIssue(
+                    severity='INFO',
+                    category='CONSISTENCY',
+                    field='category_name',
+                    message=f"{len(rare_cats)} catégories avec moins de 3 items",
+                    count=len(rare_cats),
+                    recommendation="Vérifier la pertinence de ces catégories ou les fusionner",
+                    impact="Catégories trop spécifiques ou inutiles"
+                ))
+    
+    def _calculate_quality_score(self):
+        """Calcule le score de qualité global"""
+        # Le score est déjà ajusté dans chaque méthode
+        self.score = max(0, min(100, self.score))
+    
+    def _get_grade(self) -> str:
+        """Retourne une note letter grade"""
+        if self.score >= 90:
+            return "A - Excellente qualité"
+        elif self.score >= 80:
+            return "B - Bonne qualité"
+        elif self.score >= 70:
+            return "C - Qualité moyenne"
+        elif self.score >= 60:
+            return "D - Qualité insuffisante"
+        else:
+            return "F - Qualité critique"
+    
+    def _generate_summary(self) -> str:
+        """Génère un résumé de l'analyse"""
+        summary = []
+        
+        by_severity = {}
+        for issue in self.issues:
+            by_severity[issue.severity] = by_severity.get(issue.severity, 0) + 1
+        
+        summary.append(f"**Résumé de l'analyse:**")
+        summary.append(f"- 🔴 CRITIQUE: {by_severity.get('CRITICAL', 0)}")
+        summary.append(f"- 🟠 MAJEUR: {by_severity.get('MAJOR', 0)}")
+        summary.append(f"- 🟡 MINEUR: {by_severity.get('MINOR', 0)}")
+        summary.append(f"- ⚠️  ATTENTION: {by_severity.get('WARNING', 0)}")
+        summary.append(f"- ℹ️  INFO: {by_severity.get('INFO', 0)}")
+        
+        return "\n".join(summary)
+    
+    def _generate_recommendations(self) -> List[str]:
+        """Génère des recommandations d'amélioration"""
+        recommendations = []
+        
+        # Regrouper par sévérité
+        critical_issues = [i for i in self.issues if i.severity == 'CRITICAL']
+        major_issues = [i for i in self.issues if i.severity == 'MAJOR']
+        
+        if critical_issues:
+            recommendations.append("🔴 **ACTIONS IMMÉDIATES REQUISES:**")
+            for issue in critical_issues[:5]:
+                recommendations.append(f"  • {issue.recommendation}")
+        
+        if major_issues:
+            recommendations.append("\n🟠 **AMÉLIORATIONS PRIORITAIRES:**")
+            for issue in major_issues[:5]:
+                recommendations.append(f"  • {issue.recommendation}")
+        
+        # Recommandations générales basées sur le score
+        if self.score < 50:
+            recommendations.append("\n📊 **PLAN D'ACTION:** Nettoyage complet des données nécessaire")
+        elif self.score < 70:
+            recommendations.append("\n📈 **PROCHAINES ÉTAPES:** Planifier des sessions de nettoyage ciblées")
+        elif self.score < 85:
+            recommendations.append("\n✨ **MAINTENANCE:** Mettre en place des contrôles qualité réguliers")
+        else:
+            recommendations.append("\n🏆 **FÉLICITATIONS:** Maintenir ces bonnes pratiques!")
+        
+        return recommendations
+    
+    def display_report(self):
+        """Affiche un rapport détaillé dans Streamlit"""
+        
+        st.markdown("## 🤖 Rapport IA - Analyse de Qualité Master Data")
+        
+        # Score avec jauge
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col1:
+            grade = self._get_grade().split(' - ')[0]
+            st.markdown(f"<h1 style='text-align: center;'>{grade}</h1>", unsafe_allow_html=True)
+        
+        with col2:
+            score_color = "green" if self.score >= 80 else "orange" if self.score >= 60 else "red"
+            st.markdown(f"<h1 style='text-align: center; color: {score_color};'>{self.score:.1f}/100</h1>", unsafe_allow_html=True)
+            st.progress(self.score/100)
+        
+        with col3:
+            st.metric("Items analysés", f"{self.total_items:,}")
+        
+        # Résumé
+        st.info(self._generate_summary())
+        
+        # Métriques rapides
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        with col_m1:
+            st.metric("Qualité", self._get_grade())
+        with col_m2:
+            st.metric("Problèmes", len(self.issues))
+        with col_m3:
+            critical = len([i for i in self.issues if i.severity == 'CRITICAL'])
+            st.metric("Critiques", critical, delta_color="inverse")
+        with col_m4:
+            impact = sum(i.count for i in self.issues)
+            st.metric("Items impactés", f"{min(impact, self.total_items)}/{self.total_items}")
+        
+        # Tabs pour les problèmes
+        tab_crit, tab_major, tab_other = st.tabs(["🔴 Critiques", "🟠 Majeurs", "📋 Autres"])
+        
+        with tab_crit:
+            critical_issues = [i for i in self.issues if i.severity == 'CRITICAL']
+            if critical_issues:
+                for issue in critical_issues:
+                    with st.expander(f"**{issue.field}**: {issue.message}"):
+                        st.markdown(f"""
+                        - **Recommandation:** {issue.recommendation}
+                        - **Impact:** {issue.impact}
+                        - **Items concernés:** {issue.count}
+                        - **Exemples:** {', '.join(str(e) for e in issue.examples[:3]) if issue.examples else 'N/A'}
+                        """)
+            else:
+                st.success("Aucun problème critique détecté !")
+        
+        with tab_major:
+            major_issues = [i for i in self.issues if i.severity == 'MAJOR']
+            if major_issues:
+                for issue in major_issues:
+                    with st.expander(f"**{issue.field}**: {issue.message}"):
+                        st.markdown(f"""
+                        - **Recommandation:** {issue.recommendation}
+                        - **Impact:** {issue.impact}
+                        - **Items concernés:** {issue.count}
+                        - **Exemples:** {', '.join(str(e) for e in issue.examples[:3]) if issue.examples else 'N/A'}
+                        """)
+            else:
+                st.success("Aucun problème majeur détecté !")
+        
+        with tab_other:
+            other_issues = [i for i in self.issues if i.severity not in ['CRITICAL', 'MAJOR']]
+            if other_issues:
+                for issue in other_issues:
+                    severity_icon = "🟡" if issue.severity == 'MINOR' else "⚠️" if issue.severity == 'WARNING' else "ℹ️"
+                    with st.expander(f"{severity_icon} **{issue.field}**: {issue.message}"):
+                        st.markdown(f"""
+                        - **Recommandation:** {issue.recommendation}
+                        - **Items concernés:** {issue.count}
+                        """)
+            else:
+                st.info("Aucun autre problème détecté")
+        
+        # Recommandations
+        st.markdown("## 💡 Recommandations de l'IA")
+        for rec in self._generate_recommendations():
+            st.markdown(rec)
+        
+        # Export du rapport
+        col_exp1, col_exp2 = st.columns(2)
+        with col_exp1:
+            if st.button("📥 Exporter le rapport (JSON)", use_container_width=True):
+                report_data = {
+                    'date': datetime.now().isoformat(),
+                    'total_items': self.total_items,
+                    'score': self.score,
+                    'grade': self._get_grade(),
+                    'issues': [
+                        {
+                            'severity': i.severity,
+                            'category': i.category,
+                            'field': i.field,
+                            'message': i.message,
+                            'count': i.count,
+                            'recommendation': i.recommendation,
+                            'impact': i.impact
+                        }
+                        for i in self.issues
+                    ]
+                }
+                import json
+                st.download_button(
+                    "Télécharger JSON",
+                    data=json.dumps(report_data, indent=2, ensure_ascii=False),
+                    file_name=f"rapport_qualite_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                    mime="application/json"
+                )
+        
+        with col_exp2:
+            if st.button("📊 Vue synthétique (CSV)", use_container_width=True):
+                issues_df = pd.DataFrame([
+                    {
+                        'Sévérité': i.severity,
+                        'Catégorie': i.category,
+                        'Champ': i.field,
+                        'Message': i.message,
+                        'Nombre': i.count,
+                        'Recommandation': i.recommendation
+                    }
+                    for i in self.issues
+                ])
+                csv_data = issues_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "Télécharger CSV",
+                    data=csv_data,
+                    file_name=f"issues_qualite_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
+
+# ================================================================
 # Interface Streamlit
 # ================================================================
 def main():
@@ -826,6 +1383,8 @@ def main():
                                     del st.session_state[k]
                             if 'selected_group' in st.session_state:
                                 del st.session_state.selected_group
+                            if 'last_quality_report' in st.session_state:
+                                del st.session_state.last_quality_report
                             
                             st.success(f"✅ {len(df):,} lignes chargées")
                             st.rerun()
@@ -885,14 +1444,16 @@ def main():
     df = st.session_state.df
     cache = st.session_state.cache
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    # === 5 ONGLETS MAINTENANT ===
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🔍 Analyse Globale",
-        "📝 Saisie & Vérification",
+        "📝 Saisie & Vérification", 
         "📊 Statistiques",
-        "📤 Export"
+        "📤 Export",
+        "🤖 IA Master Data Quality"  # Nouvel onglet
     ])
 
-    # === Tab 1 : Analyse Globale (CORRIGÉE avec persistance) ===
+    # === Tab 1 : Analyse Globale ===
     with tab1:
         st.header("🧹 Détection globale des doublons")
         
@@ -961,14 +1522,13 @@ def main():
                 else:
                     st.session_state.groups_df = groups_df.copy()
                     st.session_state.members_df = members_df.copy()
-                    st.session_state.selected_group = None  # Reset de la sélection
+                    st.session_state.selected_group = None
                     st.rerun()
 
         # Afficher les résultats si disponibles
         if 'groups_df' in st.session_state and len(st.session_state.groups_df) > 0:
             groups_df = st.session_state.groups_df
             
-            # ===== STATISTIQUES GLOBALES =====
             st.markdown("### 📊 Résumé des doublons")
             
             col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
@@ -984,7 +1544,6 @@ def main():
                 max_group_size = groups_df['size'].max()
                 st.metric("Plus grand groupe", int(max_group_size))
 
-            # ===== LISTE DES GROUPES =====
             st.markdown("### 📋 Liste des groupes de doublons")
             
             display_cols = ['group_id', 'size', 'representative_name',
@@ -998,31 +1557,22 @@ def main():
                 groups_display,
                 use_container_width=True,
                 column_config={
-                    'group_id': "Groupe",
-                    'size': "Taille",
-                    'representative_name': "Nom représentant",
-                    'representative_reference': "Référence",
                     'avg_score': st.column_config.ProgressColumn(
                         "Similarité",
                         format="%.1f%%",
                         min_value=0.0,
                         max_value=1.0
-                    ),
-                    'rule': "Règle"
+                    )
                 },
                 height=400
             )
 
-            # ===== DÉTAIL DES DOUBLONS PAR GROUPE (AVEC PERSISTANCE) =====
             if 'members_df' in st.session_state and len(st.session_state.members_df) > 0:
                 st.markdown("### 👥 Détail des doublons par groupe")
-                st.markdown("Sélectionnez un groupe pour voir tous ses membres")
                 
-                # Initialiser la sélection si elle n'existe pas
                 if 'selected_group' not in st.session_state:
                     st.session_state.selected_group = None
                 
-                # Filtres
                 col_filter1, col_filter2 = st.columns(2)
                 with col_filter1:
                     min_size = st.slider(
@@ -1043,20 +1593,17 @@ def main():
                             filtered_groups['representative_name'].str.contains(search_term, case=False, na=False)
                         ]
                 
-                # Créer les options du selectbox
                 if len(filtered_groups) > 0:
                     group_options = {
                         row['group_id']: f"Groupe {row['group_id']} - {row['representative_name']} ({row['size']} items)"
                         for _, row in filtered_groups.iterrows()
                     }
                     
-                    # Déterminer l'index par défaut
                     group_ids = list(group_options.keys())
                     default_index = 0
                     if st.session_state.selected_group and st.session_state.selected_group in group_ids:
                         default_index = group_ids.index(st.session_state.selected_group)
                     
-                    # Selectbox avec persistance
                     selected_group = st.selectbox(
                         "Choisir un groupe",
                         options=group_ids,
@@ -1065,12 +1612,10 @@ def main():
                         key="group_selector"
                     )
                     
-                    # Mettre à jour la session state
                     if selected_group != st.session_state.selected_group:
                         st.session_state.selected_group = selected_group
                         st.rerun()
                     
-                    # Afficher les détails du groupe sélectionné
                     if st.session_state.selected_group:
                         group_members = st.session_state.members_df[
                             st.session_state.members_df['group_id'] == st.session_state.selected_group
@@ -1086,7 +1631,6 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
                         
-                        # Colonnes à afficher
                         member_cols = ['id', 'item_name', 'reference', 'type_name', 
                                       'category_name', 'company_name', 'created_at']
                         member_cols = [c for c in member_cols if c in group_members.columns]
@@ -1099,19 +1643,9 @@ def main():
                         st.dataframe(
                             group_members[member_cols],
                             use_container_width=True,
-                            column_config={
-                                'item_name': "Nom de l'item",
-                                'reference': "Référence",
-                                'code': "Code",
-                                'type_name': "Type",
-                                'category_name': "Catégorie",
-                                'company_name': "Société",
-                                'created_at': "Créé le"
-                            },
                             height=300
                         )
                         
-                        # Options d'export
                         col_exp1, col_exp2 = st.columns(2)
                         with col_exp1:
                             csv_group = group_members.to_csv(index=False).encode('utf-8')
@@ -1122,80 +1656,8 @@ def main():
                                 mime="text/csv",
                                 use_container_width=True
                             )
-                        with col_exp2:
-                            if st.checkbox("Voir en plein écran", key="fullscreen"):
-                                st.dataframe(group_members, use_container_width=True, height=600)
                 else:
                     st.warning("Aucun groupe ne correspond aux critères")
-
-                # ===== APERÇU GLOBAL DES DOUBLONS =====
-                with st.expander("📋 Aperçu global des doublons (tous groupes confondus)"):
-                    preview_cols = ['group_id', 'item_name', 'reference', 'category_name', 'type_name']
-                    preview_cols = [c for c in preview_cols if c in st.session_state.members_df.columns]
-                    
-                    preview_df = st.session_state.members_df[preview_cols].sort_values(['group_id', 'item_name'])
-                    
-                    st.dataframe(
-                        preview_df.head(200),
-                        use_container_width=True,
-                        column_config={
-                            'group_id': "Groupe",
-                            'item_name': "Nom",
-                            'reference': "Réf",
-                            'category_name': "Catégorie"
-                        }
-                    )
-                    st.caption(f"Affichage des 200 premiers sur {len(preview_df)} doublons")
-
-                # ===== EXPORT GLOBAL =====
-                st.markdown("### 💾 Export des résultats")
-                
-                col_export1, col_export2, col_export3 = st.columns(3)
-                
-                with col_export1:
-                    csv_groups = groups_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        "📥 Groupes (CSV)",
-                        data=csv_groups,
-                        file_name=f"groupes_doublons_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                
-                with col_export2:
-                    csv_members = st.session_state.members_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        "📥 Tous les doublons (CSV)",
-                        data=csv_members,
-                        file_name=f"tous_doublons_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                
-                with col_export3:
-                    try:
-                        excel_buffer = BytesIO()
-                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            groups_df.to_excel(writer, sheet_name='Groupes', index=False)
-                            st.session_state.members_df.to_excel(writer, sheet_name='Doublons', index=False)
-                            
-                            stats_df = pd.DataFrame([
-                                ["Total groupes", len(groups_df)],
-                                ["Total doublons", groups_df['size'].sum() - len(groups_df)],
-                                ["Taille moyenne", f"{groups_df['size'].mean():.1f}"],
-                                ["Plus grand groupe", groups_df['size'].max()]
-                            ], columns=["Indicateur", "Valeur"])
-                            stats_df.to_excel(writer, sheet_name='Statistiques', index=False)
-                        
-                        st.download_button(
-                            "📥 Excel complet",
-                            data=excel_buffer.getvalue(),
-                            file_name=f"analyse_doublons_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-                    except Exception as e:
-                        st.warning("Export Excel non disponible")
 
     # === Tab 2 : Saisie & Vérification ===
     with tab2:
@@ -1470,6 +1932,35 @@ def main():
                         st.warning(f"Colonne '{bl_key}' non trouvée")
             else:
                 st.info("Aucune colonne Business Line détectée")
+
+    # === Tab 5 : IA Master Data Quality (NOUVEAU) ===
+    with tab5:
+        st.header("🤖 IA Master Data Quality")
+        st.markdown("Analyse intelligente de la qualité de vos données items")
+        
+        if st.button("🚀 Lancer l'analyse IA", type="primary", use_container_width=True):
+            with st.spinner("Analyse en cours... L'IA examine vos données..."):
+                # Initialiser l'IA
+                mda = MasterDataQualityAI(df)
+                
+                # Lancer l'analyse
+                results = mda.analyze()
+                
+                # Afficher le rapport
+                mda.display_report()
+                
+                # Sauvegarder dans session state
+                st.session_state.last_quality_analysis = results
+                st.session_state.last_quality_report = mda
+        
+        # Afficher la dernière analyse si disponible
+        elif 'last_quality_report' in st.session_state:
+            st.info("📊 Dernière analyse disponible")
+            st.session_state.last_quality_report.display_report()
+            
+            if st.button("🔄 Nouvelle analyse", use_container_width=True):
+                st.session_state.last_quality_report = None
+                st.rerun()
 
 if __name__ == "__main__":
     main()
