@@ -50,8 +50,8 @@ def init_connection_params():
             'password': 'Netis@@IT2025#',
             'query': """SELECT * 
 FROM "SCM"."API_Items" 
-WHERE created_at >= '2024-01-01' 
-AND status = 'Qualified' AND type = 0.0"""
+WHERE created_at >= '2024-05-01' 
+AND status = 'Qualified' """
         }
 
 def create_connection_string(config):
