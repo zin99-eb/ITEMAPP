@@ -1,8 +1,3 @@
-# ================================================================
-# Items — Connexion Directe au Data Warehouse Netis Group
-# Auteur : Zineb FAKKAR – Fév 2026
-# Version avec Classification Comptable Améliorée et mots-clés enrichis
-# ================================================================
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -2088,7 +2083,7 @@ class AccountingClassifier:
         # Filtres avancés
         st.markdown("### 🔍 Recherche et filtrage avancé")
         
-        col_filter1, col_filter2, col_filter3, col_filter4 = st.columns(4)
+        col_filter1, col_filter2, col_filter3, col_filter4, col_filter5 = st.columns(5)
         
         with col_filter1:
             search = st.text_input("🔎 Rechercher un item", placeholder="Nom de l'item...")
@@ -2109,6 +2104,19 @@ class AccountingClassifier:
                 value=(0.0, 1.0),
                 step=0.05
             )
+
+        with col_filter5:
+            # Filtrer par description comptable
+            if 'description_comptable' in self.classified_df.columns:
+                descriptions_list = ['Tous'] + sorted(self.classified_df['description_comptable'].dropna().unique().tolist())
+                selected_description = st.selectbox(
+                    "📋 Description comptable",
+                    descriptions_list,
+                    key="desc_filter",
+                    help="Filtrer par description comptable"
+                )
+            else:
+                selected_description = "Tous"
         
         # Appliquer les filtres
         filtered_df = self.classified_df.copy()
@@ -2129,6 +2137,14 @@ class AccountingClassifier:
             (filtered_df['accounting_confidence'] >= confidence_range[0]) &
             (filtered_df['accounting_confidence'] <= confidence_range[1])
         ]
+
+        # Appliquer le filtre par description comptable si sélectionné
+        try:
+            if selected_description != "Tous" and 'description_comptable' in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df['description_comptable'] == selected_description]
+        except NameError:
+            # selected_description may not be defined in some branches
+            pass
         
         st.markdown(f"**{len(filtered_df)} items** correspondant aux critères")
         

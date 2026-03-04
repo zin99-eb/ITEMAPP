@@ -1892,49 +1892,6 @@ class AccountingClassifier:
             'matches': list(exact_matches)[:5],
             'specific_matches': list(specific_matches)[:5]
         }
-    
-    def detect_obvious_keywords(self, item_name, french_name):
-        """Détecte des mots-clés évidents qui doivent surcharger le type_name"""
-        item_text = f"{str(item_name).lower()} {str(french_name).lower()}"
-        
-        # Règles fortes (poids très élevé)
-        strong_rules = {
-            # Générateurs - tout ce qui commence par GEN ou contient des mots-clés générateur
-            r'^gen|generator|groupe.*electrogene|genset|diesel.*gen': ('1225.001', 'Groupes électrogènes', 0.95),
-            
-            # Câbles électriques
-            r'cable.*electrique|electrical.*cable|power.*cable|mm2': ('1225.007', 'Câbles électriques', 0.95),
-            
-            # Fibre optique
-            r'fibre.*optique|fiber.*optic|fo|fusion.*splicer': ('1223.005', 'Câble FO', 0.95),
-            
-            # Peinture
-            r'peinture|paint|weather.*guard|forest.*green': ('1228.002', 'Peinture', 0.95),
-            
-            # WD40 / lubrifiants
-            r'wd40|degraissant|lubrifiant|grease|huile.*moteur': ('1227.004', 'Huiles & graisses pour maintenance', 0.95),
-            
-            # Pompes
-            r'water.*pump|pompe.*eau|pump': ('1224.005', 'Pompes et compresseurs industriels', 0.95),
-            
-            # LED / éclairage
-            r'led.*light|lampe|eclairage': ('1224.003', "Système d'éclairage", 0.95),
-            
-            # Disjoncteurs / électrique
-            r'breaker|disjoncteur|dc.*breaker': ('1225.007', 'Câbles électriques', 0.90),
-        }
-        
-        import re
-        for pattern, (code, desc, conf) in strong_rules.items():
-            if re.search(pattern, item_text, re.IGNORECASE):
-                return {
-                    'code': code,
-                    'description_fr': desc,
-                    'confidence': conf,
-                    'method': 'strong_keyword',
-                    'pattern': pattern
-                }
-        return None
         if code_entry['code_prefix'] in clean_item_text:
             bonus += 10
         
@@ -1966,78 +1923,70 @@ class AccountingClassifier:
         }
     
     def classify_item(self, item_name, french_name="", category="", type_name=""):
-        """Classifie un item unique avec priorité aux mots-clés évidents"""
-
+        """Classifie un item unique avec priorité au type_name"""
+        
         # NETTOYAGE DES VALEURS
         # ---------------------
         french_name_clean = ""
         if french_name and str(french_name).lower() != 'nan' and str(french_name).strip():
             french_name_clean = str(french_name).strip().lower()
-
+        
         item_name_clean = ""
         if item_name and str(item_name).lower() != 'nan' and str(item_name).strip():
             item_name_clean = str(item_name).strip().lower()
-
+        
         category_clean = ""
         if category and str(category).lower() != 'nan' and str(category).strip():
             category_clean = str(category).strip().lower()
-
+        
         type_name_clean = ""
         if type_name and str(type_name).lower() != 'nan' and str(type_name).strip():
             type_name_clean = str(type_name).strip().lower()
-
-        # ÉTAPE 1 : DÉTECTION DES MOTS-CLÉS ÉVIDENTS (PRIORITÉ MAXIMALE)
-        # -------------------------------------------------------------
-        obvious_match = self.detect_obvious_keywords(item_name, french_name)
-        if obvious_match:
-            return obvious_match
-
-        # ÉTAPE 2 : RECHERCHE PAR TYPE_NAME (MAIS AVEC VÉRIFICATION)
-        # ---------------------------------------------------------
+        
+        # ÉTAPE 1 : RECHERCHE PAR TYPE_NAME (PRIORITÉ MAXIMALE)
+        # -----------------------------------------------------
         if type_name_clean:
             best_type_match = None
             best_type_score = 0
-
-            # Vérifier d'abord si le type_name correspond à quelque chose d'évident
-            type_name_lower = type_name_clean.lower()
-
-            # Si le type_name contient des mots qui contredisent une classification évidente
-            # Exemple: "Travaux de construction" mais le nom contient "GEN"
-            if 'construction' in type_name_lower and 'gen' in item_name_clean:
-                # Ignorer ce type_name car il est en conflit avec une évidence
-                pass
-            else:
-                for code_entry in self.search_index:
-                    if 'type_names' in code_entry and code_entry['type_names']:
-                        if isinstance(code_entry['type_names'], list):
-                            code_type_names = ' '.join(code_entry['type_names']).lower()
-                        else:
-                            code_type_names = str(code_entry['type_names']).lower()
-
-                        if type_name_clean in code_type_names:
-                            # Calculer un score basé sur la pertinence
-                            match_score = len(type_name_clean) * 3
-
-                            # Vérifier la cohérence avec le nom
-                            if 'generator' in code_type_names and 'gen' in item_name_clean:
-                                match_score += 50  # Bonus de cohérence
-                            elif 'construction' in code_type_names and 'gen' in item_name_clean:
-                                match_score -= 30  # Malus d'incohérence
-
-                            if match_score > best_type_score:
-                                best_type_score = match_score
-                                best_type_match = code_entry
-
-                if best_type_match and best_type_score > 30:
-                    confidence = min(best_type_score / 100, 0.90)
-                    return {
-                        'code': best_type_match['code'],
-                        'description_fr': best_type_match['description_fr'],
-                        'confidence': confidence,
-                        'score': best_type_score,
-                        'matches': [f"type_match:{type_name_clean}"],
-                        'method': 'type_name_with_consistency'
-                    }
+            
+            for code_entry in self.search_index:
+                # Vérifier si le code a des type_names associés
+                if 'type_names' in code_entry and code_entry['type_names']:
+                    # type_names est une liste, la joindre en chaîne
+                    if isinstance(code_entry['type_names'], list):
+                        code_type_names = ' '.join(code_entry['type_names']).lower()
+                    else:
+                        code_type_names = str(code_entry['type_names']).lower()
+                    
+                    # Correspondance exacte (poids très élevé)
+                    if type_name_clean in code_type_names:
+                        # Calculer un score basé sur la longueur de la correspondance
+                        # Plus le type_name est long et spécifique, meilleur est le score
+                        match_score = len(type_name_clean) * 3
+                        
+                        # Bonus pour les termes très spécifiques
+                        if "generators" in type_name_clean and "1225" in code_entry['code']:
+                            match_score += 50
+                        if "fibre" in type_name_clean and "1223" in code_entry['code']:
+                            match_score += 50
+                        if "electrical" in type_name_clean and "1225" in code_entry['code']:
+                            match_score += 30
+                        
+                        if match_score > best_type_score:
+                            best_type_score = match_score
+                            best_type_match = code_entry
+            
+            # Si on a trouvé une correspondance de type_name avec un bon score
+            if best_type_match and best_type_score > 20:
+                confidence = min(best_type_score / 100, 0.95)  # Max 95% de confiance
+                return {
+                    'code': best_type_match['code'],
+                    'description_fr': best_type_match['description_fr'],
+                    'confidence': confidence,
+                    'score': best_type_score,
+                    'matches': [f"type_match:{type_name_clean}"],
+                    'method': 'type_name_exact'
+                }
         
         # ÉTAPE 2 : RECHERCHE COMBINÉE AVEC TOUS LES CHAMPS
         # -------------------------------------------------
@@ -2130,7 +2079,6 @@ class AccountingClassifier:
         results['description_comptable'] = ''
         results['confiance'] = 0.0
         results['score_classification'] = 0
-        results['methode_classification'] = ''
         
         total = len(df)
         progress_bar = st.progress(0.0)
@@ -2144,22 +2092,11 @@ class AccountingClassifier:
             type_name = str(row.get('type_name', '')) if 'type_name' in row and pd.notna(row.get('type_name', '')) else ''
             
             classification = self.classify_item(item_name, french_name, category, type_name)
-
-            # Défauts si la classification est absente ou mal formée
-            if not classification or not isinstance(classification, dict):
-                classification = {
-                    'code': 'NON_CLASSIFIE',
-                    'description_fr': 'Non classifié',
-                    'confidence': 0.0,
-                    'score': 0,
-                    'method': 'error'
-                }
-
-            results.at[orig_idx, 'code_comptable'] = classification.get('code', 'NON_CLASSIFIE')
-            results.at[orig_idx, 'description_comptable'] = classification.get('description_fr', 'Non classifié')
-            results.at[orig_idx, 'confiance'] = classification.get('confidence', 0.0)
-            results.at[orig_idx, 'score_classification'] = classification.get('score', 0)
-            results.at[orig_idx, 'methode_classification'] = classification.get('method', 'unknown')
+            
+            results.at[orig_idx, 'code_comptable'] = classification['code']
+            results.at[orig_idx, 'description_comptable'] = classification['description_fr']
+            results.at[orig_idx, 'confiance'] = classification['confidence']
+            results.at[orig_idx, 'score_classification'] = classification['score']
             
             if i % 50 == 0 or i == total:
                 progress_bar.progress(min(i / total, 1.0))
@@ -2379,117 +2316,66 @@ class RuleBasedClassifier:
                 'description': 'Huiles & graisses pour maintenance',
                 'confidence': 0.95
             },
-            
-            # Règle 23: Ventilateurs (pour générateurs)
-            {
-               'pattern': r'fan|ventilateur|radiator.*fan',
-               'type_names': ['Generators-Spare parts'],
-               'category': ['STOCKABLE'],
-               'code': '1225.001',
-               'description': 'Groupes électrogènes - Pièces détachées',
-               'confidence': 0.95,
-               'priority': 8
-            },
-
-            # Règle 21: Générateurs - PRIORITAIRE
-            {
-               'pattern': r'^gen\d+|generator|groupe.*electrogene|genset|diesel.*generator|power.*gen',
-               'type_names': ['Generators-Equipment', 'Generators-Spare parts', 'Generators-Consumables'],
-               'category': ['STOCKABLE', 'FIXED ASSET'],
-               'code': '1225.001',
-               'description': 'Groupes électrogènes',
-               'confidence': 0.98,  # Confiance plus élevée
-               'priority': 10  # Priorité haute
-            },
-            # Règle 22: Filtres à carburant (pour les générateurs)
-            {
-               'pattern': r'fuel.*filter|filtre.*carburant|prefilter|préfiltre',
-               'type_names': ['Generators-Spare parts', 'Generators-Consumables', 'FUEL FILTER'],
-               'category': ['STOCKABLE'],
-               'code': '1225.001',  # Même code que les générateurs car c'est une pièce
-               'description': 'Groupes électrogènes - Pièces détachées',
-               'confidence': 0.95,
-               'priority': 9
-            },
-
         ]
 
     
     def apply_rules(self, item_name, french_name, category, type_name):
-        """Applique les règles de classification avec priorité"""
+        """Applique les règles de classification"""
         import re
-
+        
+        # Combiner tous les textes pour la recherche
         item_text = str(item_name).lower() if item_name else ""
         french_text = str(french_name).lower() if french_name else ""
         category_text = str(category).lower() if category else ""
         type_text = str(type_name).lower() if type_name else ""
-
+        
         full_text = f"{item_text} {french_text} {category_text} {type_text}"
-
-        # Trier les règles par priorité (si le champ priority existe)
-        sorted_rules = sorted(self.rules, key=lambda x: x.get('priority', 0), reverse=True)
-
+        
         best_match = None
         best_score = 0
-
-        for rule in sorted_rules:
+        
+        for rule in self.rules:
             score = 0
-
-            if re.search(rule.get('pattern', ''), full_text, re.IGNORECASE):
-                # Score de base plus élevé pour les règles prioritaires
-                score += 50 + (rule.get('priority', 0) * 5)
-
-                # Vérifier les type_names
-                if rule.get('type_names') and type_text:
-                    for tn in rule.get('type_names', []):
+            
+            # Vérifier le pattern regex
+            if re.search(rule['pattern'], full_text, re.IGNORECASE):
+                score += 50  # Pattern trouvé = score élevé
+                
+                # Vérifier le type_name si spécifié
+                if rule['type_names'] and type_text:
+                    for tn in rule['type_names']:
                         if tn.lower() in type_text:
                             score += 30
                             break
-                        # Vérifier les correspondances partielles
-                        elif any(part in type_text for part in tn.lower().split()):
-                            score += 15
-
-                # Vérifier la catégorie si spécifié
-                if rule.get('category') and category_text:
-                    for cat in rule.get('category', []):
+                
+                # Vérifier la catégorie si spécifiée
+                if rule['category'] and category_text:
+                    for cat in rule['category']:
                         if cat.lower() in category_text:
                             score += 20
                             break
-
-                # Bonus pour les mots exacts
-                words = re.findall(r'\b\w+\b', rule.get('pattern', '').replace('.*', ' ').replace('|', ' '))
-                for word in words:
-                    if len(word) > 2 and word in full_text:
+                
+                # Bonus pour les mots exacts dans le nom
+                for word in rule['pattern'].replace('.*', ' ').replace('|', ' ').split():
+                    if len(word) > 3 and word in full_text:
                         score += 10
-
-                # Si on a un score élevé d'une règle prioritaire, on l'accepte immédiatement
-                if score > 70 and rule.get('priority', 0) > 5:
-                    confidence = min(score / 100, rule.get('confidence', 0.95))
-                    return {
-                        'code': rule['code'],
-                        'description_fr': rule.get('description', ''),
-                        'confidence': confidence,
-                        'score': score,
-                        'method': 'high_priority_rule',
-                        'rule_pattern': rule.get('pattern', '')
-                    }
-
+                
                 if score > best_score:
                     best_score = score
                     best_match = rule
-
-        if best_match and best_score > 30:
-            confidence = min(best_score / 100, best_match.get('confidence', 0.95))
+        
+        if best_match and best_score > 30:  # Seuil minimum
+            confidence = min(best_score / 100, 0.95)
             return {
                 'code': best_match['code'],
-                'description_fr': best_match.get('description', ''),
+                'description_fr': best_match['description'],
                 'confidence': confidence,
                 'score': best_score,
                 'method': 'rule_based',
-                'rule_pattern': best_match.get('pattern', '')
+                'rule_pattern': best_match['pattern']
             }
-
-        return None
+        
+        return None    
 # ================================================================
 # === MAPPING TYPE_NAME VERS CODES COMPTABLES
 # ================================================================
@@ -3057,7 +2943,7 @@ def main():
         st.markdown(f"**{len(filtered_df)} items** correspondant aux critères")
 
         # Afficher le tableau avec mise en forme
-        display_cols = ['name', 'french_name', 'category_name', 'type_name', 'code_comptable', 'description_comptable', 'confiance', 'methode_classification']
+        display_cols = ['name', 'french_name', 'category_name', 'type_name', 'code_comptable', 'description_comptable', 'confiance']
         display_cols = [c for c in display_cols if c in filtered_df.columns]
 
         # Fonction pour colorer la colonne confiance
@@ -3095,8 +2981,7 @@ def main():
             'type_name': 'Type équipement',
             'code_comptable': 'Code comptable',
             'description_comptable': 'Description',
-            'confiance': 'Confiance',
-            'methode_classification': 'Méthode'
+            'confiance': 'Confiance'
         }
         styled_df = styled_df.format_index(axis=1, formatter=lambda x: column_names.get(x, x))
 
